@@ -43,13 +43,13 @@ Name each cover after the cleaned game name:
 
 Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
 
-When a local cover is missing, GameNest searches Steam Store by game name, downloads the best available store image only when the normalized game names match, converts it to a square tile, and caches it in:
+When a local cover is missing, GameNest searches Steam Store by game name and only accepts images that are already naturally square. Rectangular store headers/capsules are discarded instead of being cropped or padded.
 
 ```text
-~/Library/Application Support/GameNest/Covers/v2
+~/Library/Application Support/GameNest/Covers/v3
 ```
 
-Local covers always take priority over cached or online covers.
+Local covers always take priority over cached or online covers. For the most reliable result, add a manually selected 1:1 cover in `/Applications/Games/Covers`.
 
 Alias naming cleanup is intentionally simple:
 

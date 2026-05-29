@@ -20,7 +20,7 @@ final class GameStore: ObservableObject {
     private var cacheDirectory: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("GameNest/Covers/v2", isDirectory: true)
+            .appendingPathComponent("GameNest/Covers/v3", isDirectory: true)
     }
 
     init() {
@@ -91,12 +91,12 @@ final class GameStore: ObservableObject {
 
         for game in missingGames {
             guard let coverData = await coverService.fetchCoverData(named: game.name),
-                  let squareCoverData = Self.squareCoverData(from: coverData),
-                  let coverImage = NSImage(data: squareCoverData) else {
+                  Self.isSquareCoverData(coverData),
+                  let coverImage = NSImage(data: coverData) else {
                 continue
             }
 
-            Self.writeCoverData(squareCoverData, named: game.name, in: cacheDirectory)
+            Self.writeCoverData(coverData, named: game.name, in: cacheDirectory)
 
             if let index = games.firstIndex(where: { $0.id == game.id }) {
                 games[index].coverImage = coverImage
@@ -104,43 +104,19 @@ final class GameStore: ObservableObject {
         }
     }
 
-    private static func squareCoverData(from data: Data) -> Data? {
-        guard let sourceImage = NSImage(data: data) else {
-            return nil
+    private static func isSquareCoverData(_ data: Data) -> Bool {
+        guard let bitmap = NSBitmapImageRep(data: data) else {
+            return false
         }
 
-        let targetSize = NSSize(width: 512, height: 512)
-        let outputImage = NSImage(size: targetSize)
-
-        outputImage.lockFocus()
-
-        NSColor(calibratedWhite: 0.08, alpha: 1).setFill()
-        NSRect(origin: .zero, size: targetSize).fill()
-
-        let imageSize = sourceImage.size
-        guard imageSize.width > 0, imageSize.height > 0 else {
-            outputImage.unlockFocus()
-            return nil
+        let width = bitmap.pixelsWide
+        let height = bitmap.pixelsHigh
+        guard width > 0, height > 0 else {
+            return false
         }
 
-        let scale = min(targetSize.width / imageSize.width, targetSize.height / imageSize.height)
-        let fittedSize = NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
-        let fittedRect = NSRect(
-            x: (targetSize.width - fittedSize.width) / 2,
-            y: (targetSize.height - fittedSize.height) / 2,
-            width: fittedSize.width,
-            height: fittedSize.height
-        )
-
-        sourceImage.draw(in: fittedRect, from: .zero, operation: .sourceOver, fraction: 1)
-        outputImage.unlockFocus()
-
-        guard let tiffData = outputImage.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData) else {
-            return nil
-        }
-
-        return bitmap.representation(using: .png, properties: [:])
+        let ratio = Double(width) / Double(height)
+        return ratio >= 0.96 && ratio <= 1.04
     }
 
     private static func writeCoverData(_ data: Data, named name: String, in directory: URL) {
@@ -154,7 +130,7 @@ final class GameStore: ObservableObject {
         let sanitizedName = name.unicodeScalars.map { scalar in
             allowedCharacters.contains(scalar) ? Character(scalar) : "-"
         }
-        return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".png"
+        return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".jpg"
     }
 }
 
@@ -291,14 +267,11 @@ struct CoverImage: View {
     let image: NSImage
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.22)
-
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .padding(6)
-        }
+        Image(nsImage: image)
+            .resizable()
+            .scaledToFill()
+            .frame(width: 104, height: 104)
+            .clipped()
     }
 }
 
