@@ -9,6 +9,19 @@ struct GameItem: Identifiable {
     var coverImage: NSImage?
     var timePlayedMinutes: Int?
     var progress: Double?
+
+    var formattedTimePlayed: String? {
+        guard let timePlayedMinutes, timePlayedMinutes > 0 else {
+            return nil
+        }
+
+        let hours = timePlayedMinutes / 60
+        if hours > 0 {
+            return "\(hours)h"
+        }
+
+        return "\(timePlayedMinutes)m"
+    }
 }
 
 enum ArtworkMode: String, CaseIterable, Identifiable {
@@ -52,6 +65,7 @@ final class GameStore: ObservableObject {
 
     private let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
     private let coverService = OnlineCoverService()
+    private let steamPlaytimeStore = SteamPlaytimeStore()
     private var coversDirectory: URL {
         gamesDirectory.appendingPathComponent("Covers", isDirectory: true)
     }
@@ -77,18 +91,21 @@ final class GameStore: ObservableObject {
             return
         }
 
+        let steamPlaytimeByName = steamPlaytimeStore.playtimeByGameName()
+
         games = urls
             .filter { $0.lastPathComponent != ".DS_Store" }
             .filter { $0.lastPathComponent != "Covers" }
             .map { url in
                 let name = Self.cleanName(for: url)
+                let normalizedName = Self.normalizedName(name)
                 return GameItem(
                     name: name,
                     url: url,
                     appIcon: NSWorkspace.shared.icon(forFile: url.path),
                     coverImage: Self.coverImage(named: name, in: coversDirectory)
                         ?? Self.coverImage(named: name, in: cacheDirectory),
-                    timePlayedMinutes: nil,
+                    timePlayedMinutes: steamPlaytimeByName[normalizedName],
                     progress: nil
                 )
             }
@@ -172,6 +189,169 @@ final class GameStore: ObservableObject {
             allowedCharacters.contains(scalar) ? Character(scalar) : "-"
         }
         return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".jpg"
+    }
+
+    private static func normalizedName(_ name: String) -> String {
+        name
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
+    }
+}
+
+final class SteamPlaytimeStore {
+    private let steamDirectory = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Steam", isDirectory: true)
+
+    func playtimeByGameName() -> [String: Int] {
+        let playtimeByAppID = steamPlaytimeByAppID()
+        guard !playtimeByAppID.isEmpty else {
+            return [:]
+        }
+
+        let namesByAppID = steamNamesByAppID()
+        var result: [String: Int] = [:]
+
+        for (appID, minutes) in playtimeByAppID {
+            guard let name = namesByAppID[appID] else {
+                continue
+            }
+
+            result[Self.normalizedName(name)] = minutes
+        }
+
+        return result
+    }
+
+    private func steamPlaytimeByAppID() -> [String: Int] {
+        let userdataDirectory = steamDirectory.appendingPathComponent("userdata", isDirectory: true)
+        guard let userDirectories = try? FileManager.default.contentsOfDirectory(
+            at: userdataDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return [:]
+        }
+
+        var result: [String: Int] = [:]
+
+        for userDirectory in userDirectories {
+            let localConfigURL = userDirectory
+                .appendingPathComponent("config", isDirectory: true)
+                .appendingPathComponent("localconfig.vdf")
+
+            guard let contents = try? String(contentsOf: localConfigURL, encoding: .utf8) else {
+                continue
+            }
+
+            for (appID, minutes) in Self.parsePlaytimeEntries(from: contents) {
+                result[appID] = max(result[appID] ?? 0, minutes)
+            }
+        }
+
+        return result
+    }
+
+    private func steamNamesByAppID() -> [String: String] {
+        let libraryFolders = steamLibraryFolders()
+        var result: [String: String] = [:]
+
+        for libraryFolder in libraryFolders {
+            let steamAppsDirectory = libraryFolder.appendingPathComponent("steamapps", isDirectory: true)
+            guard let manifestURLs = try? FileManager.default.contentsOfDirectory(
+                at: steamAppsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for manifestURL in manifestURLs where manifestURL.lastPathComponent.hasPrefix("appmanifest_") {
+                guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8),
+                      let appID = Self.firstVDFValue(named: "appid", in: contents),
+                      let name = Self.firstVDFValue(named: "name", in: contents) else {
+                    continue
+                }
+
+                result[appID] = name
+            }
+        }
+
+        return result
+    }
+
+    private func steamLibraryFolders() -> [URL] {
+        let candidates = [
+            steamDirectory.appendingPathComponent("config/libraryfolders.vdf"),
+            steamDirectory.appendingPathComponent("steamapps/libraryfolders.vdf")
+        ]
+
+        for candidate in candidates {
+            guard let contents = try? String(contentsOf: candidate, encoding: .utf8) else {
+                continue
+            }
+
+            let paths = Self.vdfValues(named: "path", in: contents)
+            if !paths.isEmpty {
+                return paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            }
+        }
+
+        return [steamDirectory]
+    }
+
+    private static func parsePlaytimeEntries(from contents: String) -> [String: Int] {
+        let pattern = #""(\d+)"\s*\{[^{}]*"Playtime"\s*"(\d+)""#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [:]
+        }
+
+        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
+        var result: [String: Int] = [:]
+
+        for match in regex.matches(in: contents, range: range) {
+            guard let appIDRange = Range(match.range(at: 1), in: contents),
+                  let playtimeRange = Range(match.range(at: 2), in: contents),
+                  let minutes = Int(contents[playtimeRange]) else {
+                continue
+            }
+
+            result[String(contents[appIDRange])] = minutes
+        }
+
+        return result
+    }
+
+    private static func firstVDFValue(named key: String, in contents: String) -> String? {
+        vdfValues(named: key, in: contents).first
+    }
+
+    private static func vdfValues(named key: String, in contents: String) -> [String] {
+        let escapedKey = NSRegularExpression.escapedPattern(for: key)
+        let pattern = "\"\(escapedKey)\"\\s*\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+
+        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
+        return regex.matches(in: contents, range: range).compactMap { match in
+            guard let valueRange = Range(match.range(at: 1), in: contents) else {
+                return nil
+            }
+            return String(contents[valueRange])
+        }
+    }
+
+    private static func normalizedName(_ name: String) -> String {
+        name
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
     }
 }
 
@@ -716,6 +896,18 @@ struct GameCoverView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(.white.opacity(0.14), lineWidth: 1)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if let formattedTimePlayed = game.formattedTimePlayed {
+                Text(formattedTimePlayed)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .frame(height: 18)
+                    .background(.black.opacity(0.58))
+                    .clipShape(Capsule())
+                    .padding(6)
+            }
         }
         .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
     }

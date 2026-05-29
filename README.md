@@ -15,6 +15,7 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
 - Games are shown in a searchable grid using square cover art with the game name below.
 - The grid can be sorted by name, time played, or progress.
+- Steam playtime is read locally from Steam's `localconfig.vdf` and installed app manifests when available.
 - A settings menu can switch artwork between game covers and macOS app icons.
 - Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
@@ -104,6 +105,7 @@ Main components:
 
 - `GameItem`: launchable item model.
 - `GameStore`: scans `/Applications/Games`, resolves local/cached cover art, sorts items.
+- `SteamPlaytimeStore`: reads local Steam playtime metadata when games can be matched by name.
 - `OnlineCoverService`: fetches and caches missing cover art from SteamGridDB and Steam Store.
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
@@ -170,6 +172,6 @@ The script is idempotent: it skips aliases that already exist and creates missin
 - Auto-generate aliases from known sources such as Steam, Heroic, Epic, Ryujinx, and `/Applications`.
 - Add cover art from SteamGridDB or IGDB.
 - Add favorites and recent launches.
-- Populate time played and progress from reliable local or platform metadata.
+- Expand time played and progress support beyond local Steam metadata.
 - Add keyboard navigation.
 - Split `main.swift` into smaller files once the app grows.
