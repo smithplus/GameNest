@@ -440,9 +440,11 @@ struct LauncherView: View {
                 Spacer()
 
                 Menu {
-                    Picker("Sort by", selection: $sortOption) {
-                        ForEach(SortOption.allCases) { option in
-                            Text(option.title).tag(option)
+                    ForEach(SortOption.allCases.filter { $0 != sortOption }) { option in
+                        Button {
+                            sortOption = option
+                        } label: {
+                            Text(option.title)
                         }
                     }
                 } label: {
