@@ -14,7 +14,7 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - The drawer opens near the current mouse position, which makes Dock clicks feel anchored to the app icon.
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
 - Games are shown in a searchable grid using square cover art with the game name below.
-- Missing cover art falls back to a generated GameNest cover instead of the macOS app icon.
+- Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
 
@@ -28,7 +28,7 @@ The app scans:
 
 Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, Steam game bundles, emulators, or launchers.
 
-Cover art is loaded from:
+Cover art is loaded locally from:
 
 ```text
 /Applications/Games/Covers
@@ -42,6 +42,14 @@ Name each cover after the cleaned game name:
 ```
 
 Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
+
+When a local cover is missing, GameNest searches Steam Store by game name, downloads the best available store image, and caches it in:
+
+```text
+~/Library/Application Support/GameNest/Covers
+```
+
+Local covers always take priority over cached or online covers.
 
 Alias naming cleanup is intentionally simple:
 
@@ -85,7 +93,8 @@ The app is intentionally compact and currently lives in a single Swift file.
 Main components:
 
 - `GameItem`: launchable item model.
-- `GameStore`: scans `/Applications/Games`, resolves cover art, sorts items.
+- `GameStore`: scans `/Applications/Games`, resolves local/cached cover art, sorts items.
+- `OnlineCoverService`: fetches and caches missing cover art from Steam Store.
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
 - `GameCoverView`: square cover renderer with generated fallback art.

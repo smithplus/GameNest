@@ -2,10 +2,10 @@ import AppKit
 import SwiftUI
 
 struct GameItem: Identifiable {
-    let id = UUID()
+    var id: String { url.path }
     let name: String
     let url: URL
-    let coverImage: NSImage?
+    var coverImage: NSImage?
 }
 
 @MainActor
@@ -13,8 +13,14 @@ final class GameStore: ObservableObject {
     @Published private(set) var games: [GameItem] = []
 
     private let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
+    private let coverService = OnlineCoverService()
     private var coversDirectory: URL {
         gamesDirectory.appendingPathComponent("Covers", isDirectory: true)
+    }
+    private var cacheDirectory: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GameNest/Covers", isDirectory: true)
     }
 
     init() {
@@ -42,9 +48,14 @@ final class GameStore: ObservableObject {
                     name: name,
                     url: url,
                     coverImage: Self.coverImage(named: name, in: coversDirectory)
+                        ?? Self.coverImage(named: name, in: cacheDirectory)
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        Task {
+            await fetchMissingCovers()
+        }
     }
 
     private static func cleanName(for url: URL) -> String {
@@ -70,6 +81,185 @@ final class GameStore: ObservableObject {
         }
 
         return nil
+    }
+
+    private func fetchMissingCovers() async {
+        let missingGames = games.filter { $0.coverImage == nil }
+        guard !missingGames.isEmpty else {
+            return
+        }
+
+        for game in missingGames {
+            guard let coverData = await coverService.fetchCoverData(named: game.name, cacheDirectory: cacheDirectory),
+                  let coverImage = NSImage(data: coverData) else {
+                continue
+            }
+
+            if let index = games.firstIndex(where: { $0.id == game.id }) {
+                games[index].coverImage = coverImage
+            }
+        }
+    }
+}
+
+actor OnlineCoverService {
+    private let session: URLSession
+    private let decoder = JSONDecoder()
+
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    func fetchCoverData(named name: String, cacheDirectory: URL) async -> Data? {
+        guard let imageURL = await steamCoverURL(for: name),
+              let imageData = await downloadImageData(from: imageURL) else {
+            return nil
+        }
+
+        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let cacheURL = cacheDirectory.appendingPathComponent(Self.cacheFileName(for: name))
+        try? imageData.write(to: cacheURL, options: [.atomic])
+
+        return imageData
+    }
+
+    private func steamCoverURL(for name: String) async -> URL? {
+        guard let appID = await steamAppID(for: name) else {
+            return nil
+        }
+
+        if let detailsImageURL = await steamAppDetailsImageURL(for: appID) {
+            return detailsImageURL
+        }
+
+        return await steamSearchImageURL(for: name)
+    }
+
+    private func steamAppID(for name: String) async -> Int? {
+        guard var components = URLComponents(string: "https://store.steampowered.com/api/storesearch/") else {
+            return nil
+        }
+
+        components.queryItems = [
+            URLQueryItem(name: "term", value: name),
+            URLQueryItem(name: "l", value: "en"),
+            URLQueryItem(name: "cc", value: Locale.current.region?.identifier ?? "US")
+        ]
+
+        guard let url = components.url,
+              let data = await data(from: url),
+              let response = try? decoder.decode(SteamSearchResponse.self, from: data) else {
+            return nil
+        }
+
+        return response.items.first { item in
+            item.type == "app" && item.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+        }?.id ?? response.items.first { $0.type == "app" }?.id
+    }
+
+    private func steamSearchImageURL(for name: String) async -> URL? {
+        guard var components = URLComponents(string: "https://store.steampowered.com/api/storesearch/") else {
+            return nil
+        }
+
+        components.queryItems = [
+            URLQueryItem(name: "term", value: name),
+            URLQueryItem(name: "l", value: "en"),
+            URLQueryItem(name: "cc", value: Locale.current.region?.identifier ?? "US")
+        ]
+
+        guard let url = components.url,
+              let data = await data(from: url),
+              let response = try? decoder.decode(SteamSearchResponse.self, from: data),
+              let imagePath = response.items.first(where: { $0.type == "app" })?.tinyImage else {
+            return nil
+        }
+
+        return URL(string: imagePath)
+    }
+
+    private func steamAppDetailsImageURL(for appID: Int) async -> URL? {
+        guard var components = URLComponents(string: "https://store.steampowered.com/api/appdetails/") else {
+            return nil
+        }
+
+        components.queryItems = [
+            URLQueryItem(name: "appids", value: String(appID)),
+            URLQueryItem(name: "filters", value: "basic")
+        ]
+
+        guard let url = components.url,
+              let data = await data(from: url),
+              let response = try? decoder.decode([String: SteamAppDetailsResponse].self, from: data),
+              let details = response[String(appID)]?.data else {
+            return nil
+        }
+
+        let imagePath = details.capsuleImageV5 ?? details.capsuleImage ?? details.headerImage
+        return imagePath.flatMap(URL.init(string:))
+    }
+
+    private func downloadImageData(from url: URL) async -> Data? {
+        await data(from: url)
+    }
+
+    private func data(from url: URL) async -> Data? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 12
+        request.setValue("GameNest/0.1", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResponse.statusCode) else {
+                return nil
+            }
+            return data
+        } catch {
+            return nil
+        }
+    }
+
+    private static func cacheFileName(for name: String) -> String {
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
+        let sanitizedName = name.unicodeScalars.map { scalar in
+            allowedCharacters.contains(scalar) ? Character(scalar) : "-"
+        }
+        return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".jpg"
+    }
+}
+
+private struct SteamSearchResponse: Decodable {
+    let items: [SteamSearchItem]
+}
+
+private struct SteamSearchItem: Decodable {
+    let id: Int
+    let name: String
+    let type: String?
+    let tinyImage: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case type
+        case tinyImage = "tiny_image"
+    }
+}
+
+private struct SteamAppDetailsResponse: Decodable {
+    let data: SteamAppDetails?
+}
+
+private struct SteamAppDetails: Decodable {
+    let headerImage: String?
+    let capsuleImage: String?
+    let capsuleImageV5: String?
+
+    enum CodingKeys: String, CodingKey {
+        case headerImage = "header_image"
+        case capsuleImage = "capsule_image"
+        case capsuleImageV5 = "capsule_imagev5"
     }
 }
 
