@@ -439,6 +439,20 @@ struct LauncherView: View {
 
                 Spacer()
 
+                Menu {
+                    Picker("Sort by", selection: $sortOption) {
+                        ForEach(SortOption.allCases) { option in
+                            Text(option.title).tag(option)
+                        }
+                    }
+                } label: {
+                    Label(sortOption.title, systemImage: "arrow.up.arrow.down")
+                        .labelStyle(.titleAndIcon)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Sort games")
+
                 Button {
                     store.reload()
                 } label: {
@@ -459,19 +473,6 @@ struct LauncherView: View {
             .frame(height: 34)
             .background(.black.opacity(0.16))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            HStack(spacing: 8) {
-                Text("Sort by")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-
-                Picker("Sort by", selection: $sortOption) {
-                    ForEach(SortOption.allCases) { option in
-                        Text(option.title).tag(option)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
         }
         .padding([.top, .horizontal], 16)
     }
