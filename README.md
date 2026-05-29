@@ -44,13 +44,21 @@ Name each cover after the cleaned game name:
 
 Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
 
-When a local cover is missing, GameNest searches Steam Store by game name and only accepts images that are already naturally square. Rectangular store headers/capsules are discarded instead of being cropped or padded.
+When a local cover is missing, GameNest first tries SteamGridDB square grids (`512x512` or `1024x1024`) when an API key is configured, then falls back to Steam Store images only when they are already naturally square. Rectangular store headers/capsules are discarded instead of being cropped or padded.
 
 ```text
 ~/Library/Application Support/GameNest/Covers/v3
 ```
 
 Local covers always take priority over cached or online covers. For the most reliable result, add a manually selected 1:1 cover in `/Applications/Games/Covers`.
+
+To enable SteamGridDB lookup, create this file with your API key:
+
+```text
+~/Library/Application Support/GameNest/steamgriddb.key
+```
+
+You can also set `STEAMGRIDDB_API_KEY` in the launch environment, but the key file works better for Dock-launched apps.
 
 Alias naming cleanup is intentionally simple:
 
@@ -95,7 +103,7 @@ Main components:
 
 - `GameItem`: launchable item model.
 - `GameStore`: scans `/Applications/Games`, resolves local/cached cover art, sorts items.
-- `OnlineCoverService`: fetches and caches missing cover art from Steam Store.
+- `OnlineCoverService`: fetches and caches missing cover art from SteamGridDB and Steam Store.
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
 - `GameCoverView`: square cover renderer with generated fallback art.

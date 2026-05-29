@@ -158,6 +158,7 @@ final class GameStore: ObservableObject {
 }
 
 actor OnlineCoverService {
+    private let steamGridDBAPIBaseURL = URL(string: "https://www.steamgriddb.com/api/v2")!
     private let session: URLSession
     private let decoder = JSONDecoder()
 
@@ -166,12 +167,91 @@ actor OnlineCoverService {
     }
 
     func fetchCoverData(named name: String) async -> Data? {
+        if let steamGridDBCoverData = await steamGridDBCoverData(for: name) {
+            return steamGridDBCoverData
+        }
+
         guard let imageURL = await steamCoverURL(for: name),
               let imageData = await downloadImageData(from: imageURL) else {
             return nil
         }
 
         return imageData
+    }
+
+    private func steamGridDBCoverData(for name: String) async -> Data? {
+        guard let apiKey = steamGridDBAPIKey(),
+              let gameID = await steamGridDBGameID(for: name, apiKey: apiKey),
+              let imageURL = await steamGridDBImageURL(for: gameID, apiKey: apiKey) else {
+            return nil
+        }
+
+        return await downloadImageData(from: imageURL)
+    }
+
+    private func steamGridDBGameID(for name: String, apiKey: String) async -> Int? {
+        let url = steamGridDBAPIBaseURL
+            .appendingPathComponent("search")
+            .appendingPathComponent("autocomplete")
+            .appendingPathComponent(name)
+
+        guard let data = await data(from: url, apiKey: apiKey),
+              let response = try? decoder.decode(SteamGridDBSearchResponse.self, from: data) else {
+            return nil
+        }
+
+        let normalizedName = Self.normalizedName(name)
+        return response.data.first { game in
+            Self.normalizedName(game.name) == normalizedName
+        }?.id
+    }
+
+    private func steamGridDBImageURL(for gameID: Int, apiKey: String) async -> URL? {
+        let url = steamGridDBAPIBaseURL
+            .appendingPathComponent("grids")
+            .appendingPathComponent("game")
+            .appendingPathComponent(String(gameID))
+
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        components.queryItems = [
+            URLQueryItem(name: "dimensions", value: "512x512,1024x1024"),
+            URLQueryItem(name: "mimes", value: "image/png,image/jpeg"),
+            URLQueryItem(name: "types", value: "static"),
+            URLQueryItem(name: "nsfw", value: "false")
+        ]
+
+        guard let requestURL = components.url,
+              let data = await data(from: requestURL, apiKey: apiKey),
+              let response = try? decoder.decode(SteamGridDBGridResponse.self, from: data) else {
+            return nil
+        }
+
+        return response.data
+            .sorted { $0.score > $1.score }
+            .compactMap { URL(string: $0.url) }
+            .first
+    }
+
+    private func steamGridDBAPIKey() -> String? {
+        if let environmentKey = ProcessInfo.processInfo.environment["STEAMGRIDDB_API_KEY"],
+           !environmentKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return environmentKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let keyURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GameNest/steamgriddb.key")
+
+        guard let key = try? String(contentsOf: keyURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else {
+            return nil
+        }
+
+        return key
     }
 
     private func steamCoverURL(for name: String) async -> URL? {
@@ -260,9 +340,16 @@ actor OnlineCoverService {
     }
 
     private func data(from url: URL) async -> Data? {
+        await data(from: url, apiKey: nil)
+    }
+
+    private func data(from url: URL, apiKey: String?) async -> Data? {
         var request = URLRequest(url: url)
         request.timeoutInterval = 12
         request.setValue("GameNest/0.1", forHTTPHeaderField: "User-Agent")
+        if let apiKey {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
 
         do {
             let (data, response) = try await session.data(for: request)
@@ -284,6 +371,24 @@ actor OnlineCoverService {
             .map { String($0) }
             .joined()
     }
+}
+
+private struct SteamGridDBSearchResponse: Decodable {
+    let data: [SteamGridDBGame]
+}
+
+private struct SteamGridDBGame: Decodable {
+    let id: Int
+    let name: String
+}
+
+private struct SteamGridDBGridResponse: Decodable {
+    let data: [SteamGridDBGrid]
+}
+
+private struct SteamGridDBGrid: Decodable {
+    let url: String
+    let score: Int
 }
 
 struct CoverImage: View {
