@@ -35,10 +35,11 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - Steam playtime is read locally from Steam's `localconfig.vdf` and installed app manifests when available.
 - The toolbar shows the app name ("GameNest"), a refresh button, and a gear button that opens a single Settings sheet.
 - The sort control sits inline with the "Games" section label directly below the search field.
-- Settings is one place for everything: artwork mode (game covers vs macOS app icons), the SteamGridDB API key with a ready/missing status indicator, and quick access to the manual covers folder.
+- Settings is one place for everything: artwork mode (game covers vs macOS app icons), the optional global shortcut, the SteamGridDB API key with a ready/missing status indicator, quick access to the manual covers folder, and the current version with a "Check for Updates" button.
 - Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
+- GameNest checks GitHub for a newer release: silently on launch (at most once per day) and on demand via a "Check for Updates" button in Settings. When a newer version exists it shows the version and a button to download the `.dmg`; it never replaces itself automatically.
 
 ## Data Source
 

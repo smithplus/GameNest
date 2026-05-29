@@ -2120,6 +2120,133 @@ final class HotKeyRecorder: ObservableObject {
     }
 }
 
+enum AppInfo {
+    static let repo = "smithplus/GameNest"
+
+    static var currentVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
+    }
+
+    static var releasesURL: URL {
+        URL(string: "https://github.com/\(repo)/releases/latest")!
+    }
+}
+
+@MainActor
+final class UpdateChecker: ObservableObject {
+    static let shared = UpdateChecker()
+
+    enum State: Equatable {
+        case idle
+        case checking
+        case upToDate
+        case available(version: String, url: URL)
+        case failed(String)
+    }
+
+    @Published var state: State = .idle
+
+    private let lastCheckKey = "lastUpdateCheck"
+
+    private init() {}
+
+    /// Silent background check, at most once per day. Shows an alert if a newer release exists.
+    func checkSilentlyIfDue() {
+        let defaults = UserDefaults.standard
+        let now = Date()
+        if let last = defaults.object(forKey: lastCheckKey) as? Date,
+           now.timeIntervalSince(last) < 60 * 60 * 24 {
+            return
+        }
+        defaults.set(now, forKey: lastCheckKey)
+
+        Task { [weak self] in
+            guard let self else { return }
+            let result = await self.fetchLatest()
+            if case let .available(version, url) = result {
+                self.state = result
+                self.presentAlert(version: version, url: url)
+            }
+        }
+    }
+
+    /// Manual check triggered from Settings. Always updates the published state.
+    func checkNow() {
+        state = .checking
+        Task { [weak self] in
+            guard let self else { return }
+            self.state = await self.fetchLatest()
+        }
+    }
+
+    private func fetchLatest() async -> State {
+        guard let api = URL(string: "https://api.github.com/repos/\(AppInfo.repo)/releases/latest") else {
+            return .failed("Bad URL.")
+        }
+        var request = URLRequest(url: api)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("GameNest", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 12
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                return .failed("GitHub returned an error.")
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = json["tag_name"] as? String else {
+                return .failed("Unexpected response.")
+            }
+
+            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+
+            // Prefer the .dmg asset; fall back to the release page.
+            var downloadURL = (json["html_url"] as? String).flatMap { URL(string: $0) } ?? AppInfo.releasesURL
+            if let assets = json["assets"] as? [[String: Any]] {
+                for asset in assets {
+                    if let name = asset["name"] as? String, name.hasSuffix(".dmg"),
+                       let urlString = asset["browser_download_url"] as? String,
+                       let url = URL(string: urlString) {
+                        downloadURL = url
+                        break
+                    }
+                }
+            }
+
+            if Self.isNewer(latest, than: AppInfo.currentVersion) {
+                return .available(version: latest, url: downloadURL)
+            } else {
+                return .upToDate
+            }
+        } catch {
+            return .failed("Could not reach GitHub.")
+        }
+    }
+
+    /// Numeric, dot-separated version compare (e.g. "0.2.0" vs "0.10.1").
+    static func isNewer(_ lhs: String, than rhs: String) -> Bool {
+        let l = lhs.split(separator: ".").map { Int($0) ?? 0 }
+        let r = rhs.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(l.count, r.count) {
+            let a = i < l.count ? l[i] : 0
+            let b = i < r.count ? r[i] : 0
+            if a != b { return a > b }
+        }
+        return false
+    }
+
+    private func presentAlert(version: String, url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Update Available"
+        alert.informativeText = "GameNest \(version) is available. You're on \(AppInfo.currentVersion)."
+        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("artworkMode") private var artworkModeRawValue = ArtworkMode.covers.rawValue
@@ -2127,6 +2254,7 @@ struct SettingsView: View {
     @AppStorage(HotKeyDefaults.modifiers) private var hotKeyModifiers = 0
     @AppStorage(HotKeyDefaults.display) private var hotKeyDisplay = ""
     @StateObject private var recorder = HotKeyRecorder()
+    @ObservedObject private var updateChecker = UpdateChecker.shared
     @State private var steamGridDBAPIKey = ""
     @State private var saveStatus: SaveStatus?
 
@@ -2303,6 +2431,33 @@ struct SettingsView: View {
                     Label("Open Covers Folder", systemImage: "folder")
                 }
             }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Updates")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    Spacer()
+
+                    Text("v\(AppInfo.currentVersion)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 10) {
+                    Button {
+                        updateChecker.checkNow()
+                    } label: {
+                        Label("Check for Updates", systemImage: "arrow.triangle.2.circlepath")
+                    }
+
+                    updateStatusView
+
+                    Spacer()
+                }
+            }
         }
         .padding(20)
         .frame(width: 420)
@@ -2317,6 +2472,33 @@ struct SettingsView: View {
         }
         .onDisappear {
             recorder.cancel()
+        }
+    }
+
+    @ViewBuilder
+    private var updateStatusView: some View {
+        switch updateChecker.state {
+        case .idle:
+            EmptyView()
+        case .checking:
+            Text("Checking…")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        case .upToDate:
+            Label("Up to date", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.green)
+        case let .available(version, url):
+            Button {
+                NSWorkspace.shared.open(url)
+            } label: {
+                Label("Download v\(version)", systemImage: "arrow.down.circle.fill")
+            }
+            .foregroundStyle(Color.accentColor)
+        case let .failed(message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.orange)
         }
     }
 
@@ -2579,6 +2761,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.mainMenu = buildMenu()
         setupGlobalHotKey()
         showPanel()
+        MainActor.assumeIsolated {
+            UpdateChecker.shared.checkSilentlyIfDue()
+        }
     }
 
     private func setupGlobalHotKey() {
