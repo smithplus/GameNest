@@ -1,14 +1,140 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
+import UniformTypeIdentifiers
+
+extension Notification.Name {
+    /// Posted by the AppDelegate whenever the launcher panel is shown, so the UI can refocus search.
+    static let gameNestPanelDidOpen = Notification.Name("gameNestPanelDidOpen")
+    /// Posted from the global hotkey handler to toggle the launcher panel.
+    static let gameNestToggleHotKey = Notification.Name("gameNestToggleHotKey")
+}
+
+/// Keys used to persist the optional user-defined global shortcut.
+enum HotKeyDefaults {
+    static let code = "globalHotKeyCode"
+    static let modifiers = "globalHotKeyModifiers"
+    static let display = "globalHotKeyDisplay"
+}
+
+/// Helpers to translate between AppKit modifier flags and Carbon hotkey flags.
+enum HotKeyUtil {
+    static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var result: UInt32 = 0
+        if flags.contains(.command) { result |= UInt32(cmdKey) }
+        if flags.contains(.option) { result |= UInt32(optionKey) }
+        if flags.contains(.control) { result |= UInt32(controlKey) }
+        if flags.contains(.shift) { result |= UInt32(shiftKey) }
+        return result
+    }
+
+    static func symbols(from flags: NSEvent.ModifierFlags) -> String {
+        var result = ""
+        if flags.contains(.control) { result += "⌃" }
+        if flags.contains(.option) { result += "⌥" }
+        if flags.contains(.shift) { result += "⇧" }
+        if flags.contains(.command) { result += "⌘" }
+        return result
+    }
+
+    static func keyLabel(for event: NSEvent) -> String {
+        switch Int(event.keyCode) {
+        case kVK_Space: return "Space"
+        case kVK_Return, kVK_ANSI_KeypadEnter: return "Return"
+        case kVK_Tab: return "Tab"
+        case kVK_Escape: return "Esc"
+        default:
+            let raw = (event.charactersIgnoringModifiers ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .uppercased()
+            return raw.isEmpty ? "Key \(event.keyCode)" : raw
+        }
+    }
+}
+
+/// Registers a single optional system-wide hotkey via Carbon and posts a
+/// notification when it fires. No default is set; the user opts in from Settings.
+final class GlobalHotKeyManager: @unchecked Sendable {
+    static let shared = GlobalHotKeyManager()
+
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerInstalled = false
+
+    private init() {}
+
+    private func installHandlerIfNeeded() {
+        guard !handlerInstalled else { return }
+        var spec = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let callback: EventHandlerUPP = { _, _, _ in
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .gameNestToggleHotKey, object: nil)
+            }
+            return noErr
+        }
+        InstallEventHandler(GetApplicationEventTarget(), callback, 1, &spec, nil, nil)
+        handlerInstalled = true
+    }
+
+    /// Registers (or clears, when modifiers are 0) the global hotkey.
+    func update(keyCode: UInt32, carbonModifiers: UInt32) {
+        unregister()
+        guard carbonModifiers != 0 else { return }
+        installHandlerIfNeeded()
+
+        let hotKeyID = EventHotKeyID(signature: OSType(0x474E5354), id: 1) // 'GNST'
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            keyCode,
+            carbonModifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        if status == noErr {
+            hotKeyRef = ref
+        }
+    }
+
+    func unregister() {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
+    }
+}
+
+enum ItemKind {
+    case game
+    case launcher
+}
 
 struct GameItem: Identifiable {
     var id: String { url.path }
+    /// Base name derived from the file (used for covers, recents, classification).
     let name: String
+    /// Name shown in the UI; equals `name` unless the user set a custom override.
+    var displayName: String = ""
+    var hasCustomName: Bool = false
     let url: URL
+    /// The target actually opened on launch: the item itself for apps/aliases, or the parsed URL for `.webloc` launchers.
+    let launchURL: URL
     let appIcon: NSImage
     var coverImage: NSImage?
+    var isFetchingCover: Bool = false
     var timePlayedMinutes: Int?
     var progress: Double?
+    var lastPlayedAt: Date?
+    var kind: ItemKind = .game
+    /// When set, launching opens this app (e.g. an emulator) with `launchArguments`
+    /// instead of opening `launchURL` directly. Used for detected emulator ROMs.
+    var emulatorURL: URL?
+    var launchArguments: [String] = []
+    /// Detected ROMs are not files inside the Games folder, so they must not be trashed.
+    var canRemove: Bool = true
 
     var formattedTimePlayed: String? {
         guard let timePlayedMinutes, timePlayedMinutes > 0 else {
@@ -21,6 +147,31 @@ struct GameItem: Identifiable {
         }
 
         return "\(timePlayedMinutes)m"
+    }
+}
+
+/// Lightweight, name-based classifier that separates real games from storefronts,
+/// launchers, emulators, and streaming/controller utilities so they can be grouped apart.
+enum GameClassifier {
+    private static let launcherKeywords: [String] = [
+        // Storefronts / launchers
+        "steam", "epicgames", "gog", "goggalaxy", "heroic", "gamehub",
+        "battlenet", "blizzard", "eaapp", "origin", "ubisoftconnect", "uplay",
+        "riotclient", "rockstargames", "amazongames", "lutris", "playnite", "itch",
+        // Emulators
+        "ryujinx", "yuzu", "dolphin", "retroarch", "openemu", "pcsx2", "rpcs3",
+        "citra", "cemu", "ppsspp", "duckstation", "mgba", "snes9x", "mupen",
+        "melonds", "bluestacks", "mame", "vita3k", "xemu", "flycast", "redream", "azahar",
+        // Streaming / controller utilities
+        "moonlight", "parsec", "steamlink", "chiaki", "geforcenow", "controller"
+    ]
+
+    static func kind(forName name: String) -> ItemKind {
+        let normalized = GameNaming.normalized(name)
+        for keyword in launcherKeywords where normalized.contains(keyword) {
+            return .launcher
+        }
+        return .game
     }
 }
 
@@ -82,6 +233,7 @@ enum ArtworkMode: String, CaseIterable, Identifiable {
 
 enum SortOption: String, CaseIterable, Identifiable {
     case name
+    case recent
     case timePlayed
     case progress
 
@@ -91,6 +243,8 @@ enum SortOption: String, CaseIterable, Identifiable {
         switch self {
         case .name:
             return "Name"
+        case .recent:
+            return "Recent"
         case .timePlayed:
             return "Time Played"
         case .progress:
@@ -99,24 +253,626 @@ enum SortOption: String, CaseIterable, Identifiable {
     }
 }
 
-@MainActor
-final class GameStore: ObservableObject {
-    @Published private(set) var games: [GameItem] = []
+enum GameNestPaths {
+    static let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
 
-    private let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
-    private let coverService = OnlineCoverService()
-    private let metadataRegistry = GameMetadataRegistry()
-    private var coversDirectory: URL {
+    static var manualCoversDirectory: URL {
         gamesDirectory.appendingPathComponent("Covers", isDirectory: true)
     }
-    private var cacheDirectory: URL {
+
+    static var metadataDirectory: URL {
+        gamesDirectory.appendingPathComponent(".metadata", isDirectory: true)
+    }
+
+    static var autoCoversDirectory: URL {
+        metadataDirectory.appendingPathComponent("covers", isDirectory: true)
+    }
+
+    static var noCoverDirectory: URL {
+        metadataDirectory.appendingPathComponent("nocover", isDirectory: true)
+    }
+
+    static var recentsFile: URL {
+        metadataDirectory.appendingPathComponent("recents.json")
+    }
+
+    static var namesFile: URL {
+        metadataDirectory.appendingPathComponent("names.json")
+    }
+
+    static var legacyCacheDirectory: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("GameNest/Covers/v3", isDirectory: true)
     }
+}
+
+/// Persists "last launched" timestamps keyed by normalized game name.
+enum RecentsStore {
+    static func load() -> [String: Date] {
+        guard let data = try? Data(contentsOf: GameNestPaths.recentsFile),
+              let raw = try? JSONDecoder().decode([String: Double].self, from: data) else {
+            return [:]
+        }
+        return raw.mapValues { Date(timeIntervalSince1970: $0) }
+    }
+
+    static func record(name: String, at date: Date = Date()) {
+        var entries = load()
+        entries[GameNaming.normalized(name)] = date
+        save(entries)
+    }
+
+    private static func save(_ entries: [String: Date]) {
+        let raw = entries.mapValues { $0.timeIntervalSince1970 }
+        guard let data = try? JSONEncoder().encode(raw) else {
+            return
+        }
+        try? FileManager.default.createDirectory(at: GameNestPaths.metadataDirectory, withIntermediateDirectories: true)
+        try? data.write(to: GameNestPaths.recentsFile, options: [.atomic])
+    }
+}
+
+/// Persists custom display-name overrides keyed by normalized base name, so renaming a tile
+/// never touches the underlying alias/file and won't trigger duplicate auto-detection.
+enum DisplayNameStore {
+    static func load() -> [String: String] {
+        guard let data = try? Data(contentsOf: GameNestPaths.namesFile),
+              let raw = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return raw
+    }
+
+    static func name(forNormalized normalized: String) -> String? {
+        let value = load()[normalized]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (value?.isEmpty == false) ? value : nil
+    }
+
+    static func set(_ name: String, forNormalized normalized: String) {
+        var entries = load()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            entries.removeValue(forKey: normalized)
+        } else {
+            entries[normalized] = trimmed
+        }
+        save(entries)
+    }
+
+    static func clear(forNormalized normalized: String) {
+        var entries = load()
+        entries.removeValue(forKey: normalized)
+        save(entries)
+    }
+
+    private static func save(_ entries: [String: String]) {
+        guard let data = try? JSONEncoder().encode(entries) else {
+            return
+        }
+        try? FileManager.default.createDirectory(at: GameNestPaths.metadataDirectory, withIntermediateDirectories: true)
+        try? data.write(to: GameNestPaths.namesFile, options: [.atomic])
+    }
+}
+
+/// Watches the games folder and fires a callback (coalesced) when its contents change.
+final class FolderWatcher {
+    private let url: URL
+    private let onChange: () -> Void
+    private var source: DispatchSourceFileSystemObject?
+    private var fileDescriptor: Int32 = -1
+    private let queue = DispatchQueue(label: "com.gamenest.folderwatcher")
+    private var debounceWorkItem: DispatchWorkItem?
+
+    init(url: URL, onChange: @escaping () -> Void) {
+        self.url = url
+        self.onChange = onChange
+        start()
+    }
+
+    deinit {
+        source?.cancel()
+        if fileDescriptor >= 0 {
+            close(fileDescriptor)
+        }
+    }
+
+    private func start() {
+        fileDescriptor = open(url.path, O_EVTONLY)
+        guard fileDescriptor >= 0 else {
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: [.write, .rename, .delete],
+            queue: queue
+        )
+
+        source.setEventHandler { [weak self] in
+            self?.scheduleCallback()
+        }
+
+        source.setCancelHandler { [weak self] in
+            guard let self, self.fileDescriptor >= 0 else {
+                return
+            }
+            close(self.fileDescriptor)
+            self.fileDescriptor = -1
+        }
+
+        self.source = source
+        source.resume()
+    }
+
+    private func scheduleCallback() {
+        debounceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.onChange()
+        }
+        debounceWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+    }
+}
+
+enum GameNaming {
+    static func cleanName(for url: URL) -> String {
+        var name = url.lastPathComponent
+        for suffix in [" alias", ".app", ".webloc"] where name.hasSuffix(suffix) {
+            name.removeLast(suffix.count)
+        }
+        return name
+    }
+
+    static func normalized(_ name: String) -> String {
+        name
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
+    }
+}
+
+/// How a detected game should be launched once it lives in the Games folder.
+enum LaunchTarget {
+    /// A real `.app` bundle that should be exposed as a Finder alias (GOG, itch.io, emulators, standalone apps).
+    case application(URL)
+    /// A URL scheme that should be exposed as a `.webloc` launcher (Steam `steam://`, etc.).
+    case urlScheme(URL)
+}
+
+struct DetectedGame {
+    let name: String
+    let launch: LaunchTarget
+}
+
+/// Creates the on-disk game library structure and migrates the old Library cache once.
+enum GameLibraryBootstrap {
+    static func run() {
+        let fileManager = FileManager.default
+        try? fileManager.createDirectory(at: GameNestPaths.gamesDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: GameNestPaths.manualCoversDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: GameNestPaths.autoCoversDirectory, withIntermediateDirectories: true)
+        migrateLegacyCovers()
+    }
+
+    private static func migrateLegacyCovers() {
+        let fileManager = FileManager.default
+        let legacy = GameNestPaths.legacyCacheDirectory
+
+        guard fileManager.fileExists(atPath: legacy.path),
+              let items = try? fileManager.contentsOfDirectory(
+                  at: legacy,
+                  includingPropertiesForKeys: nil,
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return
+        }
+
+        for item in items {
+            let destination = GameNestPaths.autoCoversDirectory.appendingPathComponent(item.lastPathComponent)
+            guard !fileManager.fileExists(atPath: destination.path) else {
+                continue
+            }
+            try? fileManager.copyItem(at: item, to: destination)
+        }
+    }
+}
+
+/// Detects installed games from multiple sources and writes launchers into `/Applications/Games`.
+enum GameInstaller {
+    static func run() {
+        GameLibraryBootstrap.run()
+
+        var claimedNames = existingNormalizedNames()
+        let detected = SteamInstalledGames.detect() + InstalledApplications.detectGames()
+
+        for game in detected {
+            let normalized = GameNaming.normalized(game.name)
+            guard !normalized.isEmpty, !claimedNames.contains(normalized) else {
+                continue
+            }
+
+            if install(game) {
+                claimedNames.insert(normalized)
+            }
+        }
+    }
+
+    private static func existingNormalizedNames() -> Set<String> {
+        let fileManager = FileManager.default
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: GameNestPaths.gamesDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return Set(
+            urls
+                .filter { $0.lastPathComponent != "Covers" && $0.lastPathComponent != ".metadata" }
+                .map { GameNaming.normalized(GameNaming.cleanName(for: $0)) }
+        )
+    }
+
+    private static func install(_ game: DetectedGame) -> Bool {
+        switch game.launch {
+        case .application(let appURL):
+            return createAlias(to: appURL, named: game.name)
+        case .urlScheme(let url):
+            return createWebloc(for: url, named: game.name)
+        }
+    }
+
+    private static func createAlias(to appURL: URL, named name: String) -> Bool {
+        let destination = GameNestPaths.gamesDirectory
+            .appendingPathComponent(sanitizedFileName(name))
+            .appendingPathExtension("app")
+
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            return false
+        }
+
+        do {
+            let bookmark = try appURL.bookmarkData(
+                options: .suitableForBookmarkFile,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            try URL.writeBookmarkData(bookmark, to: destination)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func createWebloc(for url: URL, named name: String) -> Bool {
+        let destination = GameNestPaths.gamesDirectory
+            .appendingPathComponent(sanitizedFileName(name))
+            .appendingPathExtension("webloc")
+
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            return false
+        }
+
+        do {
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: ["URL": url.absoluteString],
+                format: .xml,
+                options: 0
+            )
+            try data.write(to: destination, options: [.atomic])
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func sanitizedFileName(_ name: String) -> String {
+        let invalid: Set<Character> = ["/", ":"]
+        let cleaned = String(name.map { invalid.contains($0) ? " " : $0 })
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func weblocTarget(at fileURL: URL) -> URL? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let urlString = plist["URL"] as? String else {
+            return nil
+        }
+        return URL(string: urlString)
+    }
+}
+
+/// A ROM discovered in an emulator's configured game directories.
+struct EmulatorROM {
+    let name: String
+    let url: URL
+    let emulator: URL
+}
+
+/// Detects ROMs from installed emulators by reading their own configured game
+/// directories, so GameNest never has to guess where the user keeps ROMs.
+/// Currently supports Ryujinx (Nintendo Switch).
+enum EmulatorROMs {
+    static func detect() -> [EmulatorROM] {
+        detectRyujinx()
+    }
+
+    /// Strips common ROM-dump noise like `[TITLEID]`, `(USA)`, version tags.
+    static func cleanName(_ raw: String) -> String {
+        var value = raw
+        value = value.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "\\([^\\)]*\\)", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "_", with: " ")
+        value = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func detectRyujinx() -> [EmulatorROM] {
+        guard let ryujinx = ryujinxAppURL() else { return [] }
+
+        let romExtensions: Set<String> = ["nsp", "xci", "nca", "nro", "nsz", "xcz"]
+        let fileManager = FileManager.default
+        var roms: [EmulatorROM] = []
+        var seenPaths = Set<String>()
+
+        for directory in ryujinxGameDirectories() {
+            // Scan the directory itself plus one level of subfolders (common "folder per game" layouts).
+            var scanRoots = [directory]
+            if let entries = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                scanRoots += entries.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            }
+
+            for root in scanRoots {
+                guard let files = try? fileManager.contentsOfDirectory(
+                    at: root,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+
+                for file in files where romExtensions.contains(file.pathExtension.lowercased()) {
+                    guard seenPaths.insert(file.path).inserted else { continue }
+                    let name = cleanName(file.deletingPathExtension().lastPathComponent)
+                    roms.append(EmulatorROM(name: name.isEmpty ? file.lastPathComponent : name, url: file, emulator: ryujinx))
+                }
+            }
+        }
+
+        return roms
+    }
+
+    private static func ryujinxAppURL() -> URL? {
+        let candidate = URL(fileURLWithPath: "/Applications/Ryujinx.app")
+        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+    }
+
+    private static func ryujinxGameDirectories() -> [URL] {
+        let configURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Ryujinx/Config.json")
+
+        guard let data = try? Data(contentsOf: configURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        let gameDirs = (json["game_dirs"] as? [String]) ?? []
+        let autoloadDirs = (json["autoload_dirs"] as? [String]) ?? []
+        let unique = Array(Set(gameDirs + autoloadDirs))
+        return unique.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+}
+
+/// Reads installed Steam games from local appmanifest files and exposes them as `steam://` launchers.
+enum SteamInstalledGames {
+    private static let skippedNameFragments = [
+        "steam linux runtime",
+        "steamworks common redistributables",
+        "proton",
+        "steamvr"
+    ]
+
+    static func detect() -> [DetectedGame] {
+        var games: [DetectedGame] = []
+        var seenAppIDs: Set<String> = []
+
+        for libraryFolder in libraryFolders() {
+            let steamApps = libraryFolder.appendingPathComponent("steamapps", isDirectory: true)
+            guard let manifestURLs = try? FileManager.default.contentsOfDirectory(
+                at: steamApps,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for manifestURL in manifestURLs where manifestURL.lastPathComponent.hasPrefix("appmanifest_") {
+                guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8),
+                      let appID = vdfValue(named: "appid", in: contents),
+                      let name = vdfValue(named: "name", in: contents),
+                      !seenAppIDs.contains(appID),
+                      !isSkipped(name),
+                      let url = URL(string: "steam://rungameid/\(appID)") else {
+                    continue
+                }
+
+                seenAppIDs.insert(appID)
+                games.append(DetectedGame(name: name, launch: .urlScheme(url)))
+            }
+        }
+
+        return games
+    }
+
+    private static func isSkipped(_ name: String) -> Bool {
+        let lowercased = name.lowercased()
+        return skippedNameFragments.contains { lowercased.contains($0) }
+    }
+
+    private static var steamDirectory: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Steam", isDirectory: true)
+    }
+
+    private static func libraryFolders() -> [URL] {
+        let candidates = [
+            steamDirectory.appendingPathComponent("config/libraryfolders.vdf"),
+            steamDirectory.appendingPathComponent("steamapps/libraryfolders.vdf")
+        ]
+
+        for candidate in candidates {
+            guard let contents = try? String(contentsOf: candidate, encoding: .utf8) else {
+                continue
+            }
+
+            let paths = vdfValues(named: "path", in: contents)
+            if !paths.isEmpty {
+                return paths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            }
+        }
+
+        return [steamDirectory]
+    }
+
+    private static func vdfValue(named key: String, in contents: String) -> String? {
+        vdfValues(named: key, in: contents).first
+    }
+
+    private static func vdfValues(named key: String, in contents: String) -> [String] {
+        let escapedKey = NSRegularExpression.escapedPattern(for: key)
+        let pattern = "\"\(escapedKey)\"\\s*\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+
+        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
+        return regex.matches(in: contents, range: range).compactMap { match in
+            guard let valueRange = Range(match.range(at: 1), in: contents) else {
+                return nil
+            }
+            return String(contents[valueRange])
+        }
+    }
+}
+
+/// Detects installed `.app` games (GOG, itch.io, emulators, standalone) by their app category.
+enum InstalledApplications {
+    static func detectGames() -> [DetectedGame] {
+        let fileManager = FileManager.default
+        var roots = [URL(fileURLWithPath: "/Applications", isDirectory: true)]
+
+        if let userApps = try? fileManager.url(
+            for: .applicationDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) {
+            roots.append(userApps)
+        }
+
+        roots.append(
+            fileManager
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("itch/apps", isDirectory: true)
+        )
+
+        var result: [DetectedGame] = []
+        var seenPaths: Set<String> = []
+
+        for root in roots {
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for entry in entries {
+                for appURL in appBundles(under: entry, fileManager: fileManager) where isGame(appURL) {
+                    guard seenPaths.insert(appURL.path).inserted else {
+                        continue
+                    }
+                    let name = appURL.deletingPathExtension().lastPathComponent
+                    result.append(DetectedGame(name: name, launch: .application(appURL)))
+                }
+            }
+        }
+
+        return result
+    }
+
+    private static func appBundles(under url: URL, fileManager: FileManager) -> [URL] {
+        if url.pathExtension == "app" {
+            return [url]
+        }
+
+        // itch.io and some launchers nest the bundle one folder deep.
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return children.filter { $0.pathExtension == "app" }
+    }
+
+    private static func isGame(_ appURL: URL) -> Bool {
+        let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let category = plist["LSApplicationCategoryType"] as? String else {
+            return false
+        }
+
+        return category.lowercased().contains("games")
+    }
+}
+
+@MainActor
+final class GameStore: ObservableObject {
+    @Published private(set) var games: [GameItem] = []
+
+    private let gamesDirectory = GameNestPaths.gamesDirectory
+    private let coverService = OnlineCoverService()
+    private let metadataRegistry = GameMetadataRegistry()
+    private var coversDirectory: URL { GameNestPaths.manualCoversDirectory }
+    private var cacheDirectory: URL { GameNestPaths.autoCoversDirectory }
+    private var folderWatcher: FolderWatcher?
 
     init() {
+        GameLibraryBootstrap.run()
         reload()
+        rescan()
+        startWatchingFolder()
+    }
+
+    private func startWatchingFolder() {
+        folderWatcher = FolderWatcher(url: gamesDirectory) { [weak self] in
+            Task { @MainActor in
+                self?.reload()
+            }
+        }
+    }
+
+    /// Re-runs detection off the main thread, then refreshes the list.
+    func rescan() {
+        Task { [weak self] in
+            await Task.detached(priority: .utility) {
+                GameInstaller.run()
+            }.value
+            self?.reload()
+        }
     }
 
     func reload() {
@@ -132,24 +888,71 @@ final class GameStore: ObservableObject {
         }
 
         let metadataByName = metadataRegistry.metadataByNormalizedGameName()
+        let recents = RecentsStore.load()
+        let nameOverrides = DisplayNameStore.load()
 
-        games = urls
+        let folderItems = urls
             .filter { $0.lastPathComponent != ".DS_Store" }
             .filter { $0.lastPathComponent != "Covers" }
-            .map { url in
-                let name = Self.cleanName(for: url)
-                let normalizedName = Self.normalizedName(name)
+            .filter { $0.lastPathComponent != ".metadata" }
+            .map { url -> GameItem in
+                let name = GameNaming.cleanName(for: url)
+                let normalizedName = GameNaming.normalized(name)
                 let metadata = metadataByName[normalizedName]
+                let kind = GameClassifier.kind(forName: name)
+                let override = nameOverrides[normalizedName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let hasCustomName = (override?.isEmpty == false)
+                let displayName = hasCustomName ? override! : name
+                // Launchers/tools fall back to their real app icon instead of unreliable online
+                // game art; only an explicit manual cover in Covers/ overrides it.
+                let manualCover = Self.coverImage(named: name, in: coversDirectory)
+                let resolvedCover = kind == .launcher
+                    ? manualCover
+                    : (manualCover ?? Self.coverImage(named: name, in: cacheDirectory))
                 return GameItem(
                     name: name,
+                    displayName: displayName,
+                    hasCustomName: hasCustomName,
                     url: url,
+                    launchURL: Self.launchURL(for: url),
                     appIcon: NSWorkspace.shared.icon(forFile: url.path),
-                    coverImage: Self.coverImage(named: name, in: coversDirectory)
-                        ?? Self.coverImage(named: name, in: cacheDirectory),
+                    coverImage: resolvedCover,
                     timePlayedMinutes: metadata?.timePlayedMinutes,
-                    progress: metadata?.progress
+                    progress: metadata?.progress,
+                    lastPlayedAt: recents[normalizedName],
+                    kind: kind
                 )
             }
+
+        // Detected emulator ROMs are added in-memory (they are not files in the Games folder),
+        // skipping any whose name already matches a folder entry.
+        let existingNames = Set(folderItems.map { GameNaming.normalized($0.name) })
+        let romItems = EmulatorROMs.detect().compactMap { rom -> GameItem? in
+            let name = rom.name
+            let normalizedName = GameNaming.normalized(name)
+            guard !normalizedName.isEmpty, !existingNames.contains(normalizedName) else { return nil }
+            let override = nameOverrides[normalizedName]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasCustomName = (override?.isEmpty == false)
+            let displayName = hasCustomName ? override! : name
+            let manualCover = Self.coverImage(named: name, in: coversDirectory)
+            let resolvedCover = manualCover ?? Self.coverImage(named: name, in: cacheDirectory)
+            return GameItem(
+                name: name,
+                displayName: displayName,
+                hasCustomName: hasCustomName,
+                url: rom.url,
+                launchURL: rom.url,
+                appIcon: NSWorkspace.shared.icon(forFile: rom.emulator.path),
+                coverImage: resolvedCover,
+                lastPlayedAt: recents[normalizedName],
+                kind: .game,
+                emulatorURL: rom.emulator,
+                launchArguments: [rom.url.path],
+                canRemove: false
+            )
+        }
+
+        games = (folderItems + romItems)
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
         Task {
@@ -157,15 +960,11 @@ final class GameStore: ObservableObject {
         }
     }
 
-    private static func cleanName(for url: URL) -> String {
-        var name = url.lastPathComponent
-        if name.hasSuffix(" alias") {
-            name.removeLast(" alias".count)
+    private static func launchURL(for url: URL) -> URL {
+        if url.pathExtension == "webloc", let target = GameInstaller.weblocTarget(at: url) {
+            return target
         }
-        if name.hasSuffix(".app") {
-            name.removeLast(".app".count)
-        }
-        return name
+        return url
     }
 
     private static func coverImage(named name: String, in directory: URL) -> NSImage? {
@@ -183,24 +982,127 @@ final class GameStore: ObservableObject {
     }
 
     private func fetchMissingCovers() async {
-        let missingGames = games.filter { $0.coverImage == nil }
+        // Only attempt games with no cover and no recent "miss" marker, so we don't hit the network on every open.
+        let missingGames = games.filter { $0.kind == .game && $0.coverImage == nil && !Self.hasRecentCoverMiss(for: $0.name) }
         guard !missingGames.isEmpty else {
             return
+        }
+
+        // Show a loading skeleton on every tile we're about to look up.
+        let missingIDs = Set(missingGames.map(\.id))
+        for index in games.indices where missingIDs.contains(games[index].id) {
+            games[index].isFetchingCover = true
         }
 
         for game in missingGames {
             guard let coverData = await coverService.fetchCoverData(named: game.name),
                   Self.isSquareCoverData(coverData),
                   let coverImage = NSImage(data: coverData) else {
+                Self.markCoverMiss(for: game.name)
+                if let index = games.firstIndex(where: { $0.id == game.id }) {
+                    games[index].isFetchingCover = false
+                }
                 continue
             }
 
             Self.writeCoverData(coverData, named: game.name, in: cacheDirectory)
+            Self.clearCoverMiss(for: game.name)
 
             if let index = games.firstIndex(where: { $0.id == game.id }) {
                 games[index].coverImage = coverImage
+                games[index].isFetchingCover = false
             }
         }
+    }
+
+    /// Records the launch time so the "Recent" sort and timestamps stay current.
+    func recordLaunch(_ game: GameItem) {
+        let now = Date()
+        RecentsStore.record(name: game.name, at: now)
+        if let index = games.firstIndex(where: { $0.id == game.id }) {
+            games[index].lastPlayedAt = now
+        }
+    }
+
+    /// Forces a fresh online cover lookup by clearing the cached cover and miss marker.
+    func refreshCover(for game: GameItem) {
+        try? FileManager.default.removeItem(at: cacheDirectory.appendingPathComponent(Self.cacheFileName(for: game.name)))
+        Self.clearCoverMiss(for: game.name)
+
+        if let index = games.firstIndex(where: { $0.id == game.id }) {
+            games[index].coverImage = Self.coverImage(named: game.name, in: coversDirectory)
+        }
+
+        Task {
+            await fetchMissingCovers()
+        }
+    }
+
+    /// Copies a user-picked image into the manual covers folder and refreshes the tile.
+    func installManualCover(from sourceURL: URL, for game: GameItem) {
+        let fileExtension = sourceURL.pathExtension.isEmpty ? "png" : sourceURL.pathExtension
+        let destination = coversDirectory
+            .appendingPathComponent(game.name)
+            .appendingPathExtension(fileExtension)
+
+        try? FileManager.default.createDirectory(at: coversDirectory, withIntermediateDirectories: true)
+        // Replace any existing manual cover for this game first.
+        for ext in ["png", "jpg", "jpeg", "heic", "tiff"] {
+            try? FileManager.default.removeItem(at: coversDirectory.appendingPathComponent(game.name).appendingPathExtension(ext))
+        }
+        try? FileManager.default.copyItem(at: sourceURL, to: destination)
+        Self.clearCoverMiss(for: game.name)
+
+        if let index = games.firstIndex(where: { $0.id == game.id }) {
+            games[index].coverImage = NSImage(contentsOf: destination)
+        }
+    }
+
+    /// Moves a game's launcher entry to the Trash and refreshes the list.
+    func remove(_ game: GameItem) {
+        try? FileManager.default.trashItem(at: game.url, resultingItemURL: nil)
+        games.removeAll { $0.id == game.id }
+    }
+
+    func revealInFinder(_ game: GameItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([game.url])
+    }
+
+    /// Sets (or clears, when blank) a custom display name without touching the underlying file.
+    func setDisplayName(_ name: String, for game: GameItem) {
+        DisplayNameStore.set(name, forNormalized: GameNaming.normalized(game.name))
+        reload()
+    }
+
+    func clearDisplayName(for game: GameItem) {
+        DisplayNameStore.clear(forNormalized: GameNaming.normalized(game.name))
+        reload()
+    }
+
+    // MARK: - No-cover markers
+
+    private static let coverMissTTL: TimeInterval = 7 * 24 * 60 * 60
+
+    private static func coverMissURL(for name: String) -> URL {
+        GameNestPaths.noCoverDirectory.appendingPathComponent(cacheFileName(for: name) + ".miss")
+    }
+
+    private static func hasRecentCoverMiss(for name: String) -> Bool {
+        let url = coverMissURL(for: name)
+        guard let modified = try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date else {
+            return false
+        }
+        return Date().timeIntervalSince(modified) < coverMissTTL
+    }
+
+    private static func markCoverMiss(for name: String) {
+        try? FileManager.default.createDirectory(at: GameNestPaths.noCoverDirectory, withIntermediateDirectories: true)
+        let url = coverMissURL(for: name)
+        try? Data().write(to: url, options: [.atomic])
+    }
+
+    private static func clearCoverMiss(for name: String) {
+        try? FileManager.default.removeItem(at: coverMissURL(for: name))
     }
 
     private static func isSquareCoverData(_ data: Data) -> Bool {
@@ -230,15 +1132,6 @@ final class GameStore: ObservableObject {
             allowedCharacters.contains(scalar) ? Character(scalar) : "-"
         }
         return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".jpg"
-    }
-
-    private static func normalizedName(_ name: String) -> String {
-        name
-            .lowercased()
-            .unicodeScalars
-            .filter { CharacterSet.alphanumerics.contains($0) }
-            .map { String($0) }
-            .joined()
     }
 }
 
@@ -422,12 +1315,25 @@ actor OnlineCoverService {
 
     private func steamGridDBCoverData(for name: String) async -> Data? {
         guard let apiKey = steamGridDBAPIKey(),
-              let gameID = await steamGridDBGameID(for: name, apiKey: apiKey),
-              let imageURL = await steamGridDBImageURL(for: gameID, apiKey: apiKey) else {
+              let gameID = await steamGridDBGameID(for: name, apiKey: apiKey) else {
             return nil
         }
 
-        return await downloadImageData(from: imageURL)
+        // 1) Prefer box-art grids (square or portrait). Portrait art is center-cropped to a square tile.
+        if let gridURL = await steamGridDBImageURL(for: gameID, apiKey: apiKey),
+           let raw = await downloadImageData(from: gridURL),
+           let square = Self.squareCroppedPNGData(from: raw) {
+            return square
+        }
+
+        // 2) Fallback for launchers/emulators/apps that have no box-art: use the (already square) icon.
+        if let iconURL = await steamGridDBIconURL(for: gameID, apiKey: apiKey),
+           let raw = await downloadImageData(from: iconURL),
+           let square = Self.squareCroppedPNGData(from: raw) {
+            return square
+        }
+
+        return nil
     }
 
     private func steamGridDBGameID(for name: String, apiKey: String) async -> Int? {
@@ -441,10 +1347,13 @@ actor OnlineCoverService {
             return nil
         }
 
+        // Prefer an exact normalized match; otherwise fall back to the best-ranked search result
+        // so titles like "Prince of Persia Lost Crown" still resolve "...: The Lost Crown".
         let normalizedName = Self.normalizedName(name)
-        return response.data.first { game in
-            Self.normalizedName(game.name) == normalizedName
-        }?.id
+        if let exact = response.data.first(where: { Self.normalizedName($0.name) == normalizedName }) {
+            return exact.id
+        }
+        return response.data.first?.id
     }
 
     private func steamGridDBImageURL(for gameID: Int, apiKey: String) async -> URL? {
@@ -457,8 +1366,9 @@ actor OnlineCoverService {
             return nil
         }
 
+        // Include portrait box-art (the most common SteamGridDB format) plus square grids.
         components.queryItems = [
-            URLQueryItem(name: "dimensions", value: "512x512,1024x1024"),
+            URLQueryItem(name: "dimensions", value: "600x900,342x482,660x930,512x512,1024x1024"),
             URLQueryItem(name: "mimes", value: "image/png,image/jpeg"),
             URLQueryItem(name: "types", value: "static"),
             URLQueryItem(name: "nsfw", value: "false")
@@ -474,6 +1384,63 @@ actor OnlineCoverService {
             .sorted { $0.score > $1.score }
             .compactMap { URL(string: $0.url) }
             .first
+    }
+
+    private func steamGridDBIconURL(for gameID: Int, apiKey: String) async -> URL? {
+        let url = steamGridDBAPIBaseURL
+            .appendingPathComponent("icons")
+            .appendingPathComponent("game")
+            .appendingPathComponent(String(gameID))
+
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        components.queryItems = [
+            URLQueryItem(name: "mimes", value: "image/png,image/jpeg"),
+            URLQueryItem(name: "types", value: "static"),
+            URLQueryItem(name: "nsfw", value: "false")
+        ]
+
+        guard let requestURL = components.url,
+              let data = await data(from: requestURL, apiKey: apiKey),
+              let response = try? decoder.decode(SteamGridDBGridResponse.self, from: data) else {
+            return nil
+        }
+
+        return response.data
+            .sorted { $0.score > $1.score }
+            .compactMap { URL(string: $0.url) }
+            .first
+    }
+
+    /// Center-crops image data to a square and re-encodes it as PNG so square-tile validation passes.
+    private static func squareCroppedPNGData(from data: Data) -> Data? {
+        guard let rep = NSBitmapImageRep(data: data) else {
+            return nil
+        }
+
+        let width = rep.pixelsWide
+        let height = rep.pixelsHigh
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        // Already square (within tolerance): keep as-is, just normalize to PNG.
+        let ratio = Double(width) / Double(height)
+        if ratio >= 0.96 && ratio <= 1.04 {
+            return rep.representation(using: .png, properties: [:]) ?? data
+        }
+
+        let side = min(width, height)
+        let originX = (width - side) / 2
+        let originY = (height - side) / 2
+        guard let cgImage = rep.cgImage?.cropping(to: CGRect(x: originX, y: originY, width: side, height: side)) else {
+            return nil
+        }
+
+        let cropped = NSBitmapImageRep(cgImage: cgImage)
+        return cropped.representation(using: .png, properties: [:])
     }
 
     private func steamGridDBAPIKey() -> String? {
@@ -689,14 +1656,98 @@ extension EnvironmentValues {
     }
 }
 
+/// Drives keyboard selection (arrow keys + Enter) over the grid while the search
+/// field keeps text-entry focus. Intercepts events with a local monitor and only
+/// acts while the launcher panel is the key window.
+@MainActor
+final class LauncherKeyboard: ObservableObject {
+    @Published var selectedIndex = 0
+    /// Flat list in display order (games first, then launchers).
+    var items: [GameItem] = []
+    var columns = 3
+    var onLaunch: ((GameItem) -> Void)?
+
+    private var monitor: Any?
+
+    var selectedID: String? {
+        items.indices.contains(selectedIndex) ? items[selectedIndex].id : nil
+    }
+
+    func start() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handle(event) ? nil : event
+        }
+    }
+
+    func stop() {
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+
+    func reset() {
+        selectedIndex = 0
+    }
+
+    func updateItems(_ newItems: [GameItem]) {
+        items = newItems
+        if selectedIndex >= newItems.count {
+            selectedIndex = max(0, newItems.count - 1)
+        }
+    }
+
+    private func handle(_ event: NSEvent) -> Bool {
+        // Only navigate when the launcher panel is frontmost (not Settings or other windows).
+        guard NSApp.keyWindow is KeyablePanel, !items.isEmpty else {
+            return false
+        }
+
+        switch event.keyCode {
+        case 123: return move(-1)             // left
+        case 124: return move(1)              // right
+        case 126: return move(-columns)       // up
+        case 125: return move(columns)        // down
+        case 36, 76:                          // return / enter
+            if items.indices.contains(selectedIndex) {
+                onLaunch?(items[selectedIndex])
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    @discardableResult
+    private func move(_ delta: Int) -> Bool {
+        let next = selectedIndex + delta
+        guard items.indices.contains(next) else { return true }
+        selectedIndex = next
+        return true
+    }
+}
+
 struct LauncherView: View {
     @ObservedObject var store: GameStore
     let launch: (GameItem) -> Void
 
     @State private var searchText = ""
-    @State private var sortOption: SortOption = .name
     @State private var isShowingSettings = false
+    @FocusState private var isSearchFocused: Bool
+    @StateObject private var keyboard = LauncherKeyboard()
     @AppStorage("artworkMode") private var artworkModeRawValue = ArtworkMode.covers.rawValue
+    @AppStorage("sortOption") private var sortOptionRawValue = SortOption.name.rawValue
+
+    private var sortOption: SortOption {
+        get {
+            SortOption(rawValue: sortOptionRawValue) ?? .name
+        }
+        nonmutating set {
+            sortOptionRawValue = newValue.rawValue
+        }
+    }
 
     private let columns = [
         GridItem(.adaptive(minimum: 112, maximum: 128), spacing: 14)
@@ -711,29 +1762,6 @@ struct LauncherView: View {
         }
     }
 
-    private var gameNestSupportDirectory: URL {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("GameNest", isDirectory: true)
-    }
-
-    private var steamGridDBKeyURL: URL {
-        gameNestSupportDirectory.appendingPathComponent("steamgriddb.key")
-    }
-
-    private var manualCoversDirectory: URL {
-        URL(fileURLWithPath: "/Applications/Games/Covers", isDirectory: true)
-    }
-
-    private var isSteamGridDBConfigured: Bool {
-        guard let key = try? String(contentsOf: steamGridDBKeyURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines) else {
-            return false
-        }
-
-        return !key.isEmpty
-    }
-
     private var displayedGames: [GameItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let filteredGames: [GameItem]
@@ -742,17 +1770,28 @@ struct LauncherView: View {
             filteredGames = store.games
         } else {
             filteredGames = store.games.filter {
-                $0.name.localizedCaseInsensitiveContains(query)
+                $0.displayName.localizedCaseInsensitiveContains(query)
+                    || $0.name.localizedCaseInsensitiveContains(query)
             }
         }
 
         return filteredGames.sorted(by: sortGames)
     }
 
+    /// Visible items in the exact order they render (games first, then launchers),
+    /// used as the flat list for keyboard navigation.
+    private var orderedItems: [GameItem] {
+        let games = displayedGames.filter { $0.kind == .game }
+        let launchers = displayedGames.filter { $0.kind == .launcher }
+        return games + launchers
+    }
+
     private func sortGames(_ lhs: GameItem, _ rhs: GameItem) -> Bool {
         switch sortOption {
         case .name:
-            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
+        case .recent:
+            return compareDescending(lhs.lastPlayedAt, rhs.lastPlayedAt, lhs: lhs, rhs: rhs)
         case .timePlayed:
             return compareDescending(lhs.timePlayedMinutes, rhs.timePlayedMinutes, lhs: lhs, rhs: rhs)
         case .progress:
@@ -769,7 +1808,7 @@ struct LauncherView: View {
         switch (lhsValue, rhsValue) {
         case let (lhsValue?, rhsValue?):
             if lhsValue == rhsValue {
-                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
             }
             return lhsValue > rhsValue
         case (_?, nil):
@@ -789,17 +1828,35 @@ struct LauncherView: View {
                 if store.games.isEmpty {
                     emptyState
                 } else {
-                    ScrollView {
-                        LazyVGrid(columns: columns, spacing: 14) {
-                            ForEach(displayedGames) { game in
-                                GameButton(game: game) {
-                                    launch(game)
+                    VStack(spacing: 10) {
+                        libraryBar
+
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    let gamesOnly = displayedGames.filter { $0.kind == .game }
+                                    let launchers = displayedGames.filter { $0.kind == .launcher }
+
+                                    if !gamesOnly.isEmpty {
+                                        grid(for: gamesOnly)
+                                    }
+
+                                    if !launchers.isEmpty {
+                                        sectionHeader("Launchers & Tools")
+                                        grid(for: launchers)
+                                    }
                                 }
-                                .environment(\.artworkMode, artworkMode)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 16)
+                            }
+                            .onChange(of: keyboard.selectedIndex) {
+                                if let id = keyboard.selectedID {
+                                    withAnimation(.easeOut(duration: 0.12)) {
+                                        proxy.scrollTo(id, anchor: .center)
+                                    }
+                                }
                             }
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 16)
                     }
                 }
             }
@@ -824,31 +1881,100 @@ struct LauncherView: View {
         .sheet(isPresented: $isShowingSettings) {
             SettingsView()
         }
+        .onAppear {
+            keyboard.onLaunch = { game in launch(game) }
+            keyboard.updateItems(orderedItems)
+            keyboard.start()
+            focusSearch()
+        }
+        .onDisappear {
+            keyboard.stop()
+        }
+        .onChange(of: orderedItems.map(\.id)) {
+            keyboard.updateItems(orderedItems)
+        }
+        .onChange(of: searchText) {
+            keyboard.reset()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .gameNestPanelDidOpen)) { _ in
+            searchText = ""
+            keyboard.reset()
+            focusSearch()
+        }
+    }
+
+    private func focusSearch() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            isSearchFocused = true
+        }
+    }
+
+    private var libraryBar: some View {
+        HStack {
+            Text("Games".uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            sortMenu
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            ForEach(SortOption.allCases.filter { $0 != sortOption }) { option in
+                Button {
+                    sortOption = option
+                } label: {
+                    Text(option.title)
+                }
+            }
+        } label: {
+            Label(sortOption.title, systemImage: "arrow.up.arrow.down")
+                .labelStyle(.titleAndIcon)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Sort games")
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.top, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func grid(for items: [GameItem]) -> some View {
+        LazyVGrid(columns: columns, spacing: 14) {
+            ForEach(items) { game in
+                GameButton(
+                    game: game,
+                    isSelected: keyboard.selectedID == game.id,
+                    action: { launch(game) },
+                    onReveal: { store.revealInFinder(game) },
+                    onChooseCover: { chooseCover(for: game) },
+                    onRefreshCover: { store.refreshCover(for: game) },
+                    onRename: { renameItem(game) },
+                    onResetName: { store.clearDisplayName(for: game) },
+                    onRemove: { store.remove(game) }
+                )
+                .id(game.id)
+                .environment(\.artworkMode, artworkMode)
+            }
+        }
     }
 
     private var header: some View {
         VStack(spacing: 10) {
             HStack {
-                Text("Games")
+                Text("GameNest")
                     .font(.system(size: 20, weight: .semibold))
 
                 Spacer()
-
-                Menu {
-                    ForEach(SortOption.allCases.filter { $0 != sortOption }) { option in
-                        Button {
-                            sortOption = option
-                        } label: {
-                            Text(option.title)
-                        }
-                    }
-                } label: {
-                    Label(sortOption.title, systemImage: "arrow.up.arrow.down")
-                        .labelStyle(.titleAndIcon)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Sort games")
 
                 Button {
                     store.reload()
@@ -858,41 +1984,12 @@ struct LauncherView: View {
                 .buttonStyle(.borderless)
                 .help("Refresh")
 
-                Menu {
-                    Menu("Artwork") {
-                        ForEach(ArtworkMode.allCases) { mode in
-                            Button {
-                                artworkMode = mode
-                            } label: {
-                                HStack {
-                                    Text(mode.title)
-                                    if mode == artworkMode {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Divider()
-
-                    Text(isSteamGridDBConfigured ? "SteamGridDB Ready" : "SteamGridDB Key Missing")
-
-                    Button {
-                        isShowingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "slider.horizontal.3")
-                    }
-
-                    Button {
-                        openManualCoversFolder()
-                    } label: {
-                        Label("Open Covers Folder", systemImage: "folder")
-                    }
+                Button {
+                    isShowingSettings = true
                 } label: {
                     Image(systemName: "gearshape")
                 }
-                .menuStyle(.borderlessButton)
+                .buttonStyle(.borderless)
                 .help("Settings")
             }
 
@@ -902,6 +1999,14 @@ struct LauncherView: View {
 
                 TextField("Search games", text: $searchText)
                     .textFieldStyle(.plain)
+                    .focused($isSearchFocused)
+                    .onSubmit {
+                        // Prefer a real game over a launcher when Return is pressed.
+                        let candidate = displayedGames.first { $0.kind == .game } ?? displayedGames.first
+                        if let candidate {
+                            launch(candidate)
+                        }
+                    }
             }
             .padding(.horizontal, 12)
             .frame(height: 34)
@@ -911,9 +2016,40 @@ struct LauncherView: View {
         .padding([.top, .horizontal], 16)
     }
 
-    private func openManualCoversFolder() {
-        try? FileManager.default.createDirectory(at: manualCoversDirectory, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(manualCoversDirectory)
+    private func openGamesFolder() {
+        let games = GameNestPaths.gamesDirectory
+        try? FileManager.default.createDirectory(at: games, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(games)
+    }
+
+    private func chooseCover(for game: GameItem) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "Choose a square cover for \(game.displayName)"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            store.installManualCover(from: url, for: game)
+        }
+    }
+
+    private func renameItem(_ game: GameItem) {
+        let alert = NSAlert()
+        alert.messageText = "Rename"
+        alert.informativeText = "Display name for this item (leave empty to reset)."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = game.displayName
+        field.placeholderString = game.name
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.setDisplayName(field.stringValue, for: game)
+        }
     }
 
     private var emptyState: some View {
@@ -928,15 +2064,85 @@ struct LauncherView: View {
             Text("/Applications/Games")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            Button {
+                openGamesFolder()
+            } label: {
+                Label("Open Games Folder", systemImage: "folder")
+            }
+            .buttonStyle(.borderless)
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
+/// Captures a single modifier+key combination for the optional global shortcut.
+@MainActor
+final class HotKeyRecorder: ObservableObject {
+    @Published var isRecording = false
+    /// Called with (virtual key code, Carbon modifier mask, display string).
+    var onCapture: ((UInt32, UInt32, String) -> Void)?
+
+    private var monitor: Any?
+
+    func toggle() {
+        isRecording ? cancel() : begin()
+    }
+
+    func begin() {
+        guard monitor == nil else { return }
+        isRecording = true
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+
+            if Int(event.keyCode) == kVK_Escape {
+                self.cancel()
+                return nil
+            }
+
+            let carbon = HotKeyUtil.carbonModifiers(from: event.modifierFlags)
+            guard carbon != 0 else { return nil } // require at least one modifier
+
+            let display = HotKeyUtil.symbols(from: event.modifierFlags) + HotKeyUtil.keyLabel(for: event)
+            self.onCapture?(UInt32(event.keyCode), carbon, display)
+            self.cancel()
+            return nil
+        }
+    }
+
+    func cancel() {
+        isRecording = false
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+    }
+}
+
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("artworkMode") private var artworkModeRawValue = ArtworkMode.covers.rawValue
+    @AppStorage(HotKeyDefaults.code) private var hotKeyCode = 0
+    @AppStorage(HotKeyDefaults.modifiers) private var hotKeyModifiers = 0
+    @AppStorage(HotKeyDefaults.display) private var hotKeyDisplay = ""
+    @StateObject private var recorder = HotKeyRecorder()
     @State private var steamGridDBAPIKey = ""
     @State private var saveStatus: SaveStatus?
+
+    private var artworkMode: ArtworkMode {
+        get { ArtworkMode(rawValue: artworkModeRawValue) ?? .covers }
+        nonmutating set { artworkModeRawValue = newValue.rawValue }
+    }
+
+    private var isSteamGridDBConfigured: Bool {
+        let envKey = ProcessInfo.processInfo.environment["STEAMGRIDDB_API_KEY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let envKey, !envKey.isEmpty { return true }
+        let fileKey = (try? String(contentsOf: steamGridDBKeyURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return fileKey?.isEmpty == false
+    }
 
     private enum SaveStatus {
         case saved
@@ -993,8 +2199,67 @@ struct SettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("SteamGridDB API Key")
+                Text("Artwork")
                     .font(.system(size: 13, weight: .semibold))
+
+                Picker("Artwork", selection: Binding(
+                    get: { artworkMode },
+                    set: { artworkMode = $0 }
+                )) {
+                    ForEach(ArtworkMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Global Shortcut")
+                    .font(.system(size: 13, weight: .semibold))
+
+                Text("Optional. Set a system-wide shortcut to open GameNest from anywhere.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Text(recorder.isRecording ? "Press keys…" : (hotKeyDisplay.isEmpty ? "None" : hotKeyDisplay))
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .frame(minWidth: 90, alignment: .leading)
+                        .foregroundStyle(recorder.isRecording ? Color.accentColor : .primary)
+
+                    Button(recorder.isRecording ? "Cancel (Esc)" : "Record Shortcut") {
+                        recorder.toggle()
+                    }
+
+                    if !hotKeyDisplay.isEmpty && !recorder.isRecording {
+                        Button("Clear") {
+                            clearGlobalHotKey()
+                        }
+                    }
+
+                    Spacer()
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("SteamGridDB API Key")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    Spacer()
+
+                    Label(
+                        isSteamGridDBConfigured ? "Ready" : "Key Missing",
+                        systemImage: isSteamGridDBConfigured ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(isSteamGridDBConfigured ? Color.green : Color.orange)
+                }
 
                 SecureField("Paste API key", text: $steamGridDBAPIKey)
                     .textFieldStyle(.roundedBorder)
@@ -1043,7 +2308,23 @@ struct SettingsView: View {
         .frame(width: 420)
         .onAppear {
             loadSteamGridDBAPIKey()
+            recorder.onCapture = { code, modifiers, display in
+                hotKeyCode = Int(code)
+                hotKeyModifiers = Int(modifiers)
+                hotKeyDisplay = display
+                GlobalHotKeyManager.shared.update(keyCode: code, carbonModifiers: modifiers)
+            }
         }
+        .onDisappear {
+            recorder.cancel()
+        }
+    }
+
+    private func clearGlobalHotKey() {
+        hotKeyCode = 0
+        hotKeyModifiers = 0
+        hotKeyDisplay = ""
+        GlobalHotKeyManager.shared.update(keyCode: 0, carbonModifiers: 0)
     }
 
     private func loadSteamGridDBAPIKey() {
@@ -1087,7 +2368,14 @@ struct CalloutPointer: Shape {
 
 struct GameButton: View {
     let game: GameItem
+    var isSelected: Bool = false
     let action: () -> Void
+    let onReveal: () -> Void
+    let onChooseCover: () -> Void
+    let onRefreshCover: () -> Void
+    let onRename: () -> Void
+    let onResetName: () -> Void
+    let onRemove: () -> Void
 
     var body: some View {
         Button(action: action) {
@@ -1095,17 +2383,40 @@ struct GameButton: View {
                 GameCoverView(game: game)
                     .frame(width: 104, height: 104)
 
-                Text(game.name)
+                Text(game.displayName)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
                     .frame(height: 32, alignment: .top)
             }
             .frame(width: 116, height: 148)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(.white.opacity(isSelected ? 0.12 : 0))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.accentColor.opacity(isSelected ? 0.9 : 0), lineWidth: 2)
+            }
             .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(GameButtonStyle())
-        .help(game.name)
+        .help(game.displayName)
+        .contextMenu {
+            Button("Show in Finder", action: onReveal)
+            Divider()
+            Button("Rename…", action: onRename)
+            if game.hasCustomName {
+                Button("Reset Name", action: onResetName)
+            }
+            Divider()
+            Button("Choose Cover…", action: onChooseCover)
+            Button("Refresh Cover", action: onRefreshCover)
+            if game.canRemove {
+                Divider()
+                Button("Remove from Launcher", role: .destructive, action: onRemove)
+            }
+        }
     }
 }
 
@@ -1120,8 +2431,12 @@ struct GameCoverView: View {
                 AppIconImage(image: game.appIcon)
             } else if let coverImage = game.coverImage {
                 CoverImage(image: coverImage)
+            } else if game.kind == .launcher {
+                AppIconImage(image: game.appIcon)
+            } else if game.isFetchingCover {
+                SkeletonCover()
             } else {
-                GeneratedCover(name: game.name)
+                GeneratedCover(name: game.displayName)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -1157,6 +2472,39 @@ struct AppIconImage: View {
                 .resizable()
                 .scaledToFit()
                 .padding(18)
+        }
+    }
+}
+
+/// Shimmering placeholder shown while a cover is being fetched online.
+struct SkeletonCover: View {
+    @State private var animate = false
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.white.opacity(0.06))
+
+            LinearGradient(
+                colors: [
+                    .white.opacity(0),
+                    .white.opacity(0.18),
+                    .white.opacity(0)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .rotationEffect(.degrees(20))
+            .offset(x: animate ? 160 : -160)
+
+            Image(systemName: "photo")
+                .font(.system(size: 26, weight: .regular))
+                .foregroundStyle(.white.opacity(0.18))
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: false)) {
+                animate = true
+            }
         }
     }
 }
@@ -1213,6 +2561,13 @@ struct GameButtonStyle: ButtonStyle {
     }
 }
 
+/// Borderless panels can't become key by default, which blocks the search field from
+/// receiving focus. This subclass opts back in so autofocus and keyboard input work.
+final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let store = GameStore()
@@ -1222,7 +2577,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.mainMenu = buildMenu()
+        setupGlobalHotKey()
         showPanel()
+    }
+
+    private func setupGlobalHotKey() {
+        NotificationCenter.default.addObserver(
+            forName: .gameNestToggleHotKey,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.togglePanel()
+            }
+        }
+
+        let defaults = UserDefaults.standard
+        let code = UInt32(defaults.integer(forKey: HotKeyDefaults.code))
+        let modifiers = UInt32(defaults.integer(forKey: HotKeyDefaults.modifiers))
+        GlobalHotKeyManager.shared.update(keyCode: code, carbonModifiers: modifiers)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1259,6 +2632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .gameNestPanelDidOpen, object: nil)
 
         guard !wasVisible else {
             return
@@ -1281,7 +2655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func makePanel() -> NSPanel {
-        let panel = NSPanel(
+        let panel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: 430, height: 577),
             styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
@@ -1299,7 +2673,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.collectionBehavior = [.transient, .fullScreenAuxiliary]
         panel.contentView = NSHostingView(
             rootView: LauncherView(store: store) { [weak self] game in
-                NSWorkspace.shared.open(game.url)
+                self?.store.recordLaunch(game)
+                if let emulatorURL = game.emulatorURL {
+                    let configuration = NSWorkspace.OpenConfiguration()
+                    configuration.arguments = game.launchArguments
+                    NSWorkspace.shared.openApplication(at: emulatorURL, configuration: configuration)
+                } else {
+                    NSWorkspace.shared.open(game.launchURL)
+                }
                 self?.hidePanelAnimated()
             }
         )
@@ -1309,6 +2690,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func hidePanelAnimated() {
         guard let panel, panel.isVisible, !isHidingPanel else {
+            return
+        }
+
+        // Keep the launcher open while a modal dialog (e.g. the cover picker) is in front.
+        if NSApp.modalWindow != nil {
+            return
+        }
+
+        // Keep the launcher open while a sheet (e.g. Settings) is attached to it.
+        if panel.attachedSheet != nil {
             return
         }
 
@@ -1479,7 +2870,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func refreshGames() {
-        store.reload()
+        store.rescan()
         showPanel()
     }
 }

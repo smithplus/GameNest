@@ -6,6 +6,12 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 
 ## Current Behavior
 
+- On first launch it creates `/Applications/Games` (plus `Covers/` and a hidden `.metadata/` folder) if they do not exist.
+- It auto-detects installed games and populates `/Applications/Games`:
+  - Steam games are read from local `appmanifest_*.acf` files and exposed as `.webloc` launchers pointing at `steam://rungameid/<id>`.
+  - Real `.app` games (GOG, itch.io, emulators, standalone apps) are detected by their app category and exposed as Finder aliases.
+  - Emulator ROMs are detected in-memory from the emulator's own configured game directories (currently Ryujinx, read from `Config.json`) and shown as regular games that launch the emulator with the ROM path. ROM entries are not files in the Games folder, so they cannot be removed/trashed from the launcher.
+  - Detection is idempotent: existing entries are never duplicated, so manually added aliases are preserved.
 - Runs as a normal Dock app.
 - Clicking the Dock icon toggles the games drawer:
   - closed -> opens
@@ -14,9 +20,22 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - The drawer opens near the current mouse position, which makes Dock clicks feel anchored to the app icon.
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
 - Games are shown in a searchable grid using square cover art with the game name below.
-- The grid can be sorted by name, time played, or progress.
+- Items are split into two sections in the same drawer: real games first, then a "Launchers & Tools" section for storefronts, launchers, emulators, and streaming/controller utilities (detected by name via `GameClassifier`).
+- Launchers/tools use their real app icon instead of online game art (name matches are unreliable for generic tool names); only an explicit manual cover overrides it.
+- When the drawer opens, the search field is focused automatically and pressing Return launches the first matching game (preferring a real game over a launcher).
+- The grid supports keyboard navigation: arrow keys move a highlighted selection (with autoscroll) while the search field keeps text-entry focus, and Return launches the selected tile.
+- An optional, user-defined global shortcut (set in Settings, no default) opens/closes GameNest system-wide via a Carbon hotkey.
+- Tiles show a shimmering skeleton placeholder while their cover art is being fetched online, falling back to the generated cover if none is found.
+- Each tile has a right-click context menu: show in Finder, rename (and reset name), choose a cover manually, refresh the online cover, or remove the item from the launcher (moved to Trash).
+- Items can be renamed for display without touching the underlying file; overrides are stored in `.metadata/names.json` so they survive rescans and never trigger duplicate auto-detection.
+- The grid can be sorted by name, recent, time played, or progress; the chosen sort is remembered across sessions.
+- Recently launched games are remembered locally (in `.metadata/recents.json`) to power the "Recent" sort.
+- The library auto-refreshes when `/Applications/Games` changes on disk (files added, renamed, or removed), so manual edits show up without restarting.
+- The empty state offers a button to open the games folder directly.
 - Steam playtime is read locally from Steam's `localconfig.vdf` and installed app manifests when available.
-- A settings menu can switch artwork between game covers and macOS app icons.
+- The toolbar shows the app name ("GameNest"), a refresh button, and a gear button that opens a single Settings sheet.
+- The sort control sits inline with the "Games" section label directly below the search field.
+- Settings is one place for everything: artwork mode (game covers vs macOS app icons), the SteamGridDB API key with a ready/missing status indicator, and quick access to the manual covers folder.
 - Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
@@ -29,7 +48,7 @@ The app scans:
 /Applications/Games
 ```
 
-Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, Steam game bundles, emulators, or launchers.
+Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, emulators, or launchers. `.webloc` files are treated as URL-scheme launchers: GameNest reads the URL inside and opens it directly, which is how Steam games (`steam://rungameid/<id>`) are launched without a real `.app` to alias.
 
 Cover art is loaded locally from:
 
@@ -46,13 +65,21 @@ Name each cover after the cleaned game name:
 
 Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
 
-When a local cover is missing, GameNest first tries SteamGridDB square grids (`512x512` or `1024x1024`) when an API key is configured, then falls back to Steam Store images only when they are already naturally square. Rectangular store headers/capsules are discarded instead of being cropped or padded.
+When a local cover is missing for a real game, GameNest tries SteamGridDB (when an API key is configured). It accepts both square grids and the more common portrait box-art (`600x900` and similar), center-cropping portrait art to a square tile, and falls back to the game's SteamGridDB icon when no grid exists. Name matching prefers an exact match but falls back to the best-ranked search result so titles like "Prince of Persia Lost Crown" still resolve "Prince of Persia: The Lost Crown". If SteamGridDB has nothing, it falls back to Steam Store images only when they are already naturally square; rectangular store headers/capsules are discarded instead of being cropped or padded.
+
+Launchers and tools never use online game art (matches on generic names like "Steam" or "Controller" are unreliable). They show their real app icon unless an explicit manual cover is added in `Covers/`.
+
+When an online lookup fails, a small zero-byte marker is written to `/Applications/Games/.metadata/nocover` so the same game is not re-fetched on every reload. The marker expires after seven days, and choosing or refreshing a cover manually clears it immediately.
+
+Fetched covers are saved next to the games themselves, inside a hidden metadata folder, so they live with the library instead of in a separate Library cache:
 
 ```text
-~/Library/Application Support/GameNest/Covers/v3
+/Applications/Games/.metadata/covers
 ```
 
-Local covers always take priority over cached or online covers. For the most reliable result, add a manually selected 1:1 cover in `/Applications/Games/Covers`.
+The first time the app runs, any covers from the old cache location (`~/Library/Application Support/GameNest/Covers/v3`) are migrated into the new metadata folder automatically.
+
+Local covers always take priority over saved or online covers. The lookup order is: manual `Covers/` → saved `.metadata/covers/` → online. For the most reliable result, add a manually selected 1:1 cover in `/Applications/Games/Covers`.
 
 To enable SteamGridDB lookup, create this file with your API key:
 
@@ -62,7 +89,7 @@ To enable SteamGridDB lookup, create this file with your API key:
 
 You can also set `STEAMGRIDDB_API_KEY` in the launch environment, but the key file works better for Dock-launched apps.
 
-The settings panel lets users paste and save their SteamGridDB API key, shows save feedback, opens the SteamGridDB API page, and opens the manual covers folder.
+The settings panel lets users switch artwork mode, paste and save their SteamGridDB API key (with a ready/missing status indicator), shows save feedback, opens the SteamGridDB API page, and opens the manual covers folder.
 
 Alias naming cleanup is intentionally simple:
 
@@ -82,6 +109,8 @@ GameNest/
 ├── Info.plist
 ├── README.md
 ├── package_app.sh
+├── Resources/
+│   └── AppIcon.icns   # bundled Dock/app icon
 ├── Scripts/
 │   └── Game Alias Builder.applescript
 ├── Sources/
@@ -105,8 +134,19 @@ The app is intentionally compact and currently lives in a single Swift file.
 
 Main components:
 
-- `GameItem`: launchable item model.
-- `GameStore`: scans `/Applications/Games`, resolves local/cached cover art, sorts items.
+- `GameItem`: launchable item model, including the resolved `launchURL` (the item itself for apps/aliases, or the parsed URL for `.webloc` launchers) and `lastPlayedAt`.
+- `GameNestPaths`: central definition of the games folder, manual covers, hidden `.metadata` folders, the no-cover marker folder, the recents file, and the names file.
+- `GameClassifier`: lightweight, name-based classifier that separates real games from launchers/storefronts/emulators/utilities.
+- `RecentsStore`: persists recently launched games to `.metadata/recents.json`.
+- `DisplayNameStore`: persists per-item display-name overrides to `.metadata/names.json`, keyed by normalized base name.
+- `FolderWatcher`: watches `/Applications/Games` with a debounced file-system source and triggers a reload on change.
+- `GameNaming`: shared name cleanup and normalization (strips ` alias`, `.app`, `.webloc`).
+- `GameLibraryBootstrap`: creates the folder structure and migrates the legacy cover cache.
+- `GameInstaller`: runs detection and writes Finder aliases / `.webloc` launchers into the games folder, idempotently.
+- `SteamInstalledGames`: detects installed Steam games from local manifests.
+- `InstalledApplications`: detects installed `.app` games by app category (GOG, itch.io, emulators, standalone).
+- `EmulatorROMs`: detects ROMs from an emulator's configured game directories (Ryujinx) and exposes them as in-memory games launched via the emulator.
+- `GameStore`: scans `/Applications/Games`, merges detected emulator ROMs, resolves local/saved cover art, sorts items, and triggers detection via `rescan()`.
 - `GameMetadataRegistry`: merges optional platform metadata providers without requiring any one store to exist.
 - `SteamMetadataProvider`: reads local Steam playtime metadata when games can be matched by name.
 - `OnlineCoverService`: fetches and caches missing cover art from SteamGridDB and Steam Store.
@@ -172,9 +212,8 @@ The script is idempotent: it skips aliases that already exist and creates missin
 ## Future Ideas
 
 - Add a settings view for the games folder path.
-- Auto-generate aliases from known sources such as Steam, Heroic, Epic, Ryujinx, and `/Applications`.
-- Add cover art from SteamGridDB or IGDB.
-- Add favorites and recent launches.
+- Extend auto-detection to more launchers (Heroic, Epic, Ryujinx) beyond Steam and category-tagged apps.
+- Add favorites.
 - Expand time played and progress support beyond local Steam metadata.
-- Add keyboard navigation.
+- Add full keyboard navigation across the grid (search focus and Return-to-launch already exist).
 - Split `main.swift` into smaller files once the app grows.
