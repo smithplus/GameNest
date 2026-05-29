@@ -24,6 +24,46 @@ struct GameItem: Identifiable {
     }
 }
 
+struct GameMetadata {
+    var timePlayedMinutes: Int?
+    var progress: Double?
+}
+
+protocol GameMetadataProvider {
+    var name: String { get }
+    func metadataByNormalizedGameName() -> [String: GameMetadata]
+}
+
+final class GameMetadataRegistry {
+    private let providers: [GameMetadataProvider]
+
+    init(providers: [GameMetadataProvider] = [SteamMetadataProvider()]) {
+        self.providers = providers
+    }
+
+    func metadataByNormalizedGameName() -> [String: GameMetadata] {
+        var result: [String: GameMetadata] = [:]
+
+        for provider in providers {
+            let providerMetadata = provider.metadataByNormalizedGameName()
+            for (name, metadata) in providerMetadata {
+                result[name] = (result[name] ?? GameMetadata()).merging(metadata)
+            }
+        }
+
+        return result
+    }
+}
+
+private extension GameMetadata {
+    func merging(_ other: GameMetadata) -> GameMetadata {
+        GameMetadata(
+            timePlayedMinutes: other.timePlayedMinutes ?? timePlayedMinutes,
+            progress: other.progress ?? progress
+        )
+    }
+}
+
 enum ArtworkMode: String, CaseIterable, Identifiable {
     case covers
     case appIcons
@@ -65,7 +105,7 @@ final class GameStore: ObservableObject {
 
     private let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
     private let coverService = OnlineCoverService()
-    private let steamPlaytimeStore = SteamPlaytimeStore()
+    private let metadataRegistry = GameMetadataRegistry()
     private var coversDirectory: URL {
         gamesDirectory.appendingPathComponent("Covers", isDirectory: true)
     }
@@ -91,7 +131,7 @@ final class GameStore: ObservableObject {
             return
         }
 
-        let steamPlaytimeByName = steamPlaytimeStore.playtimeByGameName()
+        let metadataByName = metadataRegistry.metadataByNormalizedGameName()
 
         games = urls
             .filter { $0.lastPathComponent != ".DS_Store" }
@@ -99,14 +139,15 @@ final class GameStore: ObservableObject {
             .map { url in
                 let name = Self.cleanName(for: url)
                 let normalizedName = Self.normalizedName(name)
+                let metadata = metadataByName[normalizedName]
                 return GameItem(
                     name: name,
                     url: url,
                     appIcon: NSWorkspace.shared.icon(forFile: url.path),
                     coverImage: Self.coverImage(named: name, in: coversDirectory)
                         ?? Self.coverImage(named: name, in: cacheDirectory),
-                    timePlayedMinutes: steamPlaytimeByName[normalizedName],
-                    progress: nil
+                    timePlayedMinutes: metadata?.timePlayedMinutes,
+                    progress: metadata?.progress
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -201,26 +242,28 @@ final class GameStore: ObservableObject {
     }
 }
 
-final class SteamPlaytimeStore {
+final class SteamMetadataProvider: GameMetadataProvider {
+    let name = "Steam"
+
     private let steamDirectory = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Steam", isDirectory: true)
 
-    func playtimeByGameName() -> [String: Int] {
+    func metadataByNormalizedGameName() -> [String: GameMetadata] {
         let playtimeByAppID = steamPlaytimeByAppID()
         guard !playtimeByAppID.isEmpty else {
             return [:]
         }
 
         let namesByAppID = steamNamesByAppID()
-        var result: [String: Int] = [:]
+        var result: [String: GameMetadata] = [:]
 
         for (appID, minutes) in playtimeByAppID {
             guard let name = namesByAppID[appID] else {
                 continue
             }
 
-            result[Self.normalizedName(name)] = minutes
+            result[Self.normalizedName(name)] = GameMetadata(timePlayedMinutes: minutes, progress: nil)
         }
 
         return result

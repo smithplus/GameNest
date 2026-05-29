@@ -105,7 +105,8 @@ Main components:
 
 - `GameItem`: launchable item model.
 - `GameStore`: scans `/Applications/Games`, resolves local/cached cover art, sorts items.
-- `SteamPlaytimeStore`: reads local Steam playtime metadata when games can be matched by name.
+- `GameMetadataRegistry`: merges optional platform metadata providers without requiring any one store to exist.
+- `SteamMetadataProvider`: reads local Steam playtime metadata when games can be matched by name.
 - `OnlineCoverService`: fetches and caches missing cover art from SteamGridDB and Steam Store.
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
