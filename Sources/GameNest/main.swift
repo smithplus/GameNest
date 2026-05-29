@@ -936,6 +936,30 @@ struct LauncherView: View {
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var steamGridDBAPIKey = ""
+    @State private var saveStatus: SaveStatus?
+
+    private enum SaveStatus {
+        case saved
+        case failed
+
+        var message: String {
+            switch self {
+            case .saved:
+                return "API key saved. Refresh games to fetch covers."
+            case .failed:
+                return "Could not save API key."
+            }
+        }
+
+        var color: Color {
+            switch self {
+            case .saved:
+                return .green
+            case .failed:
+                return .red
+            }
+        }
+    }
 
     private var supportDirectory: URL {
         FileManager.default
@@ -974,6 +998,9 @@ struct SettingsView: View {
 
                 SecureField("Paste API key", text: $steamGridDBAPIKey)
                     .textFieldStyle(.roundedBorder)
+                    .onChange(of: steamGridDBAPIKey) {
+                        saveStatus = nil
+                    }
 
                 HStack {
                     Button {
@@ -990,6 +1017,12 @@ struct SettingsView: View {
                     .keyboardShortcut(.defaultAction)
 
                     Spacer()
+                }
+
+                if let saveStatus {
+                    Label(saveStatus.message, systemImage: saveStatus == .saved ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(saveStatus.color)
                 }
             }
 
@@ -1019,9 +1052,14 @@ struct SettingsView: View {
     }
 
     private func saveSteamGridDBAPIKey() {
-        try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-        let key = steamGridDBAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? key.write(to: steamGridDBKeyURL, atomically: true, encoding: .utf8)
+        do {
+            try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+            let key = steamGridDBAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            try key.write(to: steamGridDBKeyURL, atomically: true, encoding: .utf8)
+            saveStatus = .saved
+        } catch {
+            saveStatus = .failed
+        }
     }
 
     private func openSteamGridDBAPIPage() {
@@ -1383,6 +1421,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
 
         appMenu.addItem(
             NSMenuItem(
@@ -1402,6 +1442,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
+
+        editMenu.addItem(
+            NSMenuItem(
+                title: "Cut",
+                action: #selector(NSText.cut(_:)),
+                keyEquivalent: "x"
+            )
+        )
+        editMenu.addItem(
+            NSMenuItem(
+                title: "Copy",
+                action: #selector(NSText.copy(_:)),
+                keyEquivalent: "c"
+            )
+        )
+        editMenu.addItem(
+            NSMenuItem(
+                title: "Paste",
+                action: #selector(NSText.paste(_:)),
+                keyEquivalent: "v"
+            )
+        )
+        editMenu.addItem(.separator())
+        editMenu.addItem(
+            NSMenuItem(
+                title: "Select All",
+                action: #selector(NSText.selectAll(_:)),
+                keyEquivalent: "a"
+            )
+        )
+
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
         return mainMenu
     }
 
