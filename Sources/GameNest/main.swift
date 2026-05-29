@@ -5,9 +5,26 @@ struct GameItem: Identifiable {
     var id: String { url.path }
     let name: String
     let url: URL
+    let appIcon: NSImage
     var coverImage: NSImage?
     var timePlayedMinutes: Int?
     var progress: Double?
+}
+
+enum ArtworkMode: String, CaseIterable, Identifiable {
+    case covers
+    case appIcons
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .covers:
+            return "Covers"
+        case .appIcons:
+            return "App Icons"
+        }
+    }
 }
 
 enum SortOption: String, CaseIterable, Identifiable {
@@ -68,6 +85,7 @@ final class GameStore: ObservableObject {
                 return GameItem(
                     name: name,
                     url: url,
+                    appIcon: NSWorkspace.shared.icon(forFile: url.path),
                     coverImage: Self.coverImage(named: name, in: coversDirectory)
                         ?? Self.coverImage(named: name, in: cacheDirectory),
                     timePlayedMinutes: nil,
@@ -437,16 +455,37 @@ private struct SteamAppDetails: Decodable {
     }
 }
 
+private struct ArtworkModeKey: EnvironmentKey {
+    static let defaultValue = ArtworkMode.covers
+}
+
+extension EnvironmentValues {
+    var artworkMode: ArtworkMode {
+        get { self[ArtworkModeKey.self] }
+        set { self[ArtworkModeKey.self] = newValue }
+    }
+}
+
 struct LauncherView: View {
     @ObservedObject var store: GameStore
     let launch: (GameItem) -> Void
 
     @State private var searchText = ""
     @State private var sortOption: SortOption = .name
+    @AppStorage("artworkMode") private var artworkModeRawValue = ArtworkMode.covers.rawValue
 
     private let columns = [
         GridItem(.adaptive(minimum: 112, maximum: 128), spacing: 14)
     ]
+
+    private var artworkMode: ArtworkMode {
+        get {
+            ArtworkMode(rawValue: artworkModeRawValue) ?? .covers
+        }
+        nonmutating set {
+            artworkModeRawValue = newValue.rawValue
+        }
+    }
 
     private var displayedGames: [GameItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -509,6 +548,7 @@ struct LauncherView: View {
                                 GameButton(game: game) {
                                     launch(game)
                                 }
+                                .environment(\.artworkMode, artworkMode)
                             }
                         }
                         .padding(.horizontal, 16)
@@ -567,6 +607,27 @@ struct LauncherView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Refresh")
+
+                Menu {
+                    Menu("Artwork") {
+                        ForEach(ArtworkMode.allCases) { mode in
+                            Button {
+                                artworkMode = mode
+                            } label: {
+                                HStack {
+                                    Text(mode.title)
+                                    if mode == artworkMode {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .menuStyle(.borderlessButton)
+                .help("Settings")
             }
 
             HStack(spacing: 8) {
@@ -639,9 +700,13 @@ struct GameButton: View {
 struct GameCoverView: View {
     let game: GameItem
 
+    @Environment(\.artworkMode) private var artworkMode
+
     var body: some View {
         ZStack {
-            if let coverImage = game.coverImage {
+            if artworkMode == .appIcons {
+                AppIconImage(image: game.appIcon)
+            } else if let coverImage = game.coverImage {
                 CoverImage(image: coverImage)
             } else {
                 GeneratedCover(name: game.name)
@@ -653,6 +718,22 @@ struct GameCoverView: View {
                 .stroke(.white.opacity(0.14), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
+    }
+}
+
+struct AppIconImage: View {
+    let image: NSImage
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.white.opacity(0.08))
+
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .padding(18)
+        }
     }
 }
 

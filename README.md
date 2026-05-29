@@ -15,6 +15,7 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
 - Games are shown in a searchable grid using square cover art with the game name below.
 - The grid can be sorted by name, time played, or progress.
+- A settings menu can switch artwork between game covers and macOS app icons.
 - Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
@@ -107,6 +108,7 @@ Main components:
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
 - `GameCoverView`: square cover renderer with generated fallback art.
+- `ArtworkMode`: persisted setting for switching between covers and app icons.
 - `CalloutPointer`: triangle pointer at the bottom of the drawer.
 - `AppDelegate`: AppKit lifecycle, Dock toggle behavior, panel positioning, animations, single-instance guard.
 
