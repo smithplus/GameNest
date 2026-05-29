@@ -13,7 +13,8 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - Clicking outside the drawer closes it.
 - The drawer opens near the current mouse position, which makes Dock clicks feel anchored to the app icon.
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
-- Games are shown in a searchable grid using their macOS app/alias icons.
+- Games are shown in a searchable grid using square cover art with the game name below.
+- Missing cover art falls back to a generated GameNest cover instead of the macOS app icon.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
 
@@ -26,6 +27,21 @@ The app scans:
 ```
 
 Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, Steam game bundles, emulators, or launchers.
+
+Cover art is loaded from:
+
+```text
+/Applications/Games/Covers
+```
+
+Name each cover after the cleaned game name:
+
+```text
+/Applications/Games/Covers/Factorio.jpg
+/Applications/Games/Covers/Dota 2.png
+```
+
+Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
 
 Alias naming cleanup is intentionally simple:
 
@@ -69,9 +85,10 @@ The app is intentionally compact and currently lives in a single Swift file.
 Main components:
 
 - `GameItem`: launchable item model.
-- `GameStore`: scans `/Applications/Games`, resolves icons, sorts items.
+- `GameStore`: scans `/Applications/Games`, resolves cover art, sorts items.
 - `LauncherView`: SwiftUI drawer UI with search and grid.
 - `GameButton`: individual game tile.
+- `GameCoverView`: square cover renderer with generated fallback art.
 - `CalloutPointer`: triangle pointer at the bottom of the drawer.
 - `AppDelegate`: AppKit lifecycle, Dock toggle behavior, panel positioning, animations, single-instance guard.
 

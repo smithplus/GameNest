@@ -1,11 +1,11 @@
 import AppKit
 import SwiftUI
 
-struct GameItem: Identifiable, Hashable {
+struct GameItem: Identifiable {
     let id = UUID()
     let name: String
     let url: URL
-    let icon: NSImage
+    let coverImage: NSImage?
 }
 
 @MainActor
@@ -13,6 +13,9 @@ final class GameStore: ObservableObject {
     @Published private(set) var games: [GameItem] = []
 
     private let gamesDirectory = URL(fileURLWithPath: "/Applications/Games", isDirectory: true)
+    private var coversDirectory: URL {
+        gamesDirectory.appendingPathComponent("Covers", isDirectory: true)
+    }
 
     init() {
         reload()
@@ -32,11 +35,13 @@ final class GameStore: ObservableObject {
 
         games = urls
             .filter { $0.lastPathComponent != ".DS_Store" }
+            .filter { $0.lastPathComponent != "Covers" }
             .map { url in
-                GameItem(
-                    name: Self.cleanName(for: url),
+                let name = Self.cleanName(for: url)
+                return GameItem(
+                    name: name,
                     url: url,
-                    icon: NSWorkspace.shared.icon(forFile: url.path)
+                    coverImage: Self.coverImage(named: name, in: coversDirectory)
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -52,6 +57,20 @@ final class GameStore: ObservableObject {
         }
         return name
     }
+
+    private static func coverImage(named name: String, in directory: URL) -> NSImage? {
+        let supportedExtensions = ["png", "jpg", "jpeg", "heic", "tiff"]
+        let fileManager = FileManager.default
+
+        for fileExtension in supportedExtensions {
+            let coverURL = directory.appendingPathComponent(name).appendingPathExtension(fileExtension)
+            if fileManager.fileExists(atPath: coverURL.path), let image = NSImage(contentsOf: coverURL) {
+                return image
+            }
+        }
+
+        return nil
+    }
 }
 
 struct LauncherView: View {
@@ -61,7 +80,7 @@ struct LauncherView: View {
     @State private var searchText = ""
 
     private let columns = [
-        GridItem(.adaptive(minimum: 86, maximum: 112), spacing: 14)
+        GridItem(.adaptive(minimum: 112, maximum: 128), spacing: 14)
     ]
 
     private var filteredGames: [GameItem] {
@@ -182,11 +201,9 @@ struct GameButton: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 8) {
-                Image(nsImage: game.icon)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 56, height: 56)
+            VStack(spacing: 9) {
+                GameCoverView(game: game)
+                    .frame(width: 104, height: 104)
 
                 Text(game.name)
                     .font(.system(size: 12, weight: .medium))
@@ -194,11 +211,77 @@ struct GameButton: View {
                     .multilineTextAlignment(.center)
                     .frame(height: 32, alignment: .top)
             }
-            .frame(width: 96, height: 108)
-            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(width: 116, height: 148)
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(GameButtonStyle())
         .help(game.name)
+    }
+}
+
+struct GameCoverView: View {
+    let game: GameItem
+
+    var body: some View {
+        ZStack {
+            if let coverImage = game.coverImage {
+                Image(nsImage: coverImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 104, height: 104)
+                    .clipped()
+            } else {
+                GeneratedCover(name: game.name)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.white.opacity(0.14), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
+    }
+}
+
+struct GeneratedCover: View {
+    let name: String
+
+    private var initials: String {
+        let words = name.split(separator: " ")
+        let letters = words.prefix(2).compactMap(\.first)
+        let value = String(letters).uppercased()
+        return value.isEmpty ? "GN" : value
+    }
+
+    private var palette: [Color] {
+        let palettes: [[Color]] = [
+            [Color(red: 0.10, green: 0.33, blue: 0.37), Color(red: 0.86, green: 0.36, blue: 0.24)],
+            [Color(red: 0.22, green: 0.18, blue: 0.42), Color(red: 0.18, green: 0.58, blue: 0.77)],
+            [Color(red: 0.15, green: 0.34, blue: 0.22), Color(red: 0.88, green: 0.68, blue: 0.29)],
+            [Color(red: 0.37, green: 0.15, blue: 0.22), Color(red: 0.72, green: 0.30, blue: 0.55)],
+            [Color(red: 0.12, green: 0.20, blue: 0.31), Color(red: 0.20, green: 0.68, blue: 0.50)]
+        ]
+
+        let value = name.unicodeScalars.reduce(0) { result, scalar in
+            result &+ Int(scalar.value)
+        }
+        let index = value % palettes.count
+        return palettes[index]
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: palette, startPoint: .topLeading, endPoint: .bottomTrailing)
+
+            Image(systemName: "gamecontroller.fill")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.18))
+                .offset(x: 26, y: -26)
+
+            Text(initials)
+                .font(.system(size: 28, weight: .heavy, design: .rounded))
+                .foregroundStyle(.white)
+        }
     }
 }
 
