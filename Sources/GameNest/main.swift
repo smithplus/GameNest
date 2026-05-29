@@ -6,6 +6,27 @@ struct GameItem: Identifiable {
     let name: String
     let url: URL
     var coverImage: NSImage?
+    var timePlayedMinutes: Int?
+    var progress: Double?
+}
+
+enum SortOption: String, CaseIterable, Identifiable {
+    case name
+    case timePlayed
+    case progress
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name:
+            return "Name"
+        case .timePlayed:
+            return "Time Played"
+        case .progress:
+            return "Progress"
+        }
+    }
 }
 
 @MainActor
@@ -48,7 +69,9 @@ final class GameStore: ObservableObject {
                     name: name,
                     url: url,
                     coverImage: Self.coverImage(named: name, in: coversDirectory)
-                        ?? Self.coverImage(named: name, in: cacheDirectory)
+                        ?? Self.coverImage(named: name, in: cacheDirectory),
+                    timePlayedMinutes: nil,
+                    progress: nil
                 )
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -314,19 +337,56 @@ struct LauncherView: View {
     let launch: (GameItem) -> Void
 
     @State private var searchText = ""
+    @State private var sortOption: SortOption = .name
 
     private let columns = [
         GridItem(.adaptive(minimum: 112, maximum: 128), spacing: 14)
     ]
 
-    private var filteredGames: [GameItem] {
+    private var displayedGames: [GameItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            return store.games
+        let filteredGames: [GameItem]
+
+        if query.isEmpty {
+            filteredGames = store.games
+        } else {
+            filteredGames = store.games.filter {
+                $0.name.localizedCaseInsensitiveContains(query)
+            }
         }
 
-        return store.games.filter {
-            $0.name.localizedCaseInsensitiveContains(query)
+        return filteredGames.sorted(by: sortGames)
+    }
+
+    private func sortGames(_ lhs: GameItem, _ rhs: GameItem) -> Bool {
+        switch sortOption {
+        case .name:
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        case .timePlayed:
+            return compareDescending(lhs.timePlayedMinutes, rhs.timePlayedMinutes, lhs: lhs, rhs: rhs)
+        case .progress:
+            return compareDescending(lhs.progress, rhs.progress, lhs: lhs, rhs: rhs)
+        }
+    }
+
+    private func compareDescending<T: Comparable>(
+        _ lhsValue: T?,
+        _ rhsValue: T?,
+        lhs: GameItem,
+        rhs: GameItem
+    ) -> Bool {
+        switch (lhsValue, rhsValue) {
+        case let (lhsValue?, rhsValue?):
+            if lhsValue == rhsValue {
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+            return lhsValue > rhsValue
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        case (nil, nil):
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
     }
 
@@ -340,7 +400,7 @@ struct LauncherView: View {
                 } else {
                     ScrollView {
                         LazyVGrid(columns: columns, spacing: 14) {
-                            ForEach(filteredGames) { game in
+                            ForEach(displayedGames) { game in
                                 GameButton(game: game) {
                                     launch(game)
                                 }
@@ -399,6 +459,19 @@ struct LauncherView: View {
             .frame(height: 34)
             .background(.black.opacity(0.16))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            HStack(spacing: 8) {
+                Text("Sort by")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Picker("Sort by", selection: $sortOption) {
+                    ForEach(SortOption.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
         }
         .padding([.top, .horizontal], 16)
     }

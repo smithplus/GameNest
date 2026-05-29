@@ -14,6 +14,7 @@ The app is intended to work alongside macOS Dock Stacks: `/Applications/Games` r
 - The drawer opens near the current mouse position, which makes Dock clicks feel anchored to the app icon.
 - The drawer uses a native translucent material, a small callout pointer, and short fade/slide animations.
 - Games are shown in a searchable grid using square cover art with the game name below.
+- The grid can be sorted by name, time played, or progress.
 - Missing local cover art is fetched from Steam Store when possible, cached locally, and then falls back to a generated GameNest cover.
 - Clicking a game opens it with `NSWorkspace.shared.open`.
 - Only one instance should remain running. If a second instance starts, it activates the existing one and exits.
@@ -159,5 +160,6 @@ The script is idempotent: it skips aliases that already exist and creates missin
 - Auto-generate aliases from known sources such as Steam, Heroic, Epic, Ryujinx, and `/Applications`.
 - Add cover art from SteamGridDB or IGDB.
 - Add favorites and recent launches.
+- Populate time played and progress from reliable local or platform metadata.
 - Add keyboard navigation.
 - Split `main.swift` into smaller files once the app grows.
