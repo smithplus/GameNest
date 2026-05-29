@@ -62,7 +62,7 @@ To enable SteamGridDB lookup, create this file with your API key:
 
 You can also set `STEAMGRIDDB_API_KEY` in the launch environment, but the key file works better for Dock-launched apps.
 
-The settings menu can create/reveal the key file and open the manual covers folder.
+The settings panel lets users paste and save their SteamGridDB API key, opens the SteamGridDB API page, and opens the manual covers folder.
 
 Alias naming cleanup is intentionally simple:
 

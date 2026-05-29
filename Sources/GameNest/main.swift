@@ -695,6 +695,7 @@ struct LauncherView: View {
 
     @State private var searchText = ""
     @State private var sortOption: SortOption = .name
+    @State private var isShowingSettings = false
     @AppStorage("artworkMode") private var artworkModeRawValue = ArtworkMode.covers.rawValue
 
     private let columns = [
@@ -820,6 +821,9 @@ struct LauncherView: View {
                 .offset(y: -1)
         }
         .frame(width: 430, height: 577)
+        .sheet(isPresented: $isShowingSettings) {
+            SettingsView()
+        }
     }
 
     private var header: some View {
@@ -875,9 +879,9 @@ struct LauncherView: View {
                     Text(isSteamGridDBConfigured ? "SteamGridDB Ready" : "SteamGridDB Key Missing")
 
                     Button {
-                        revealSteamGridDBKeyFile()
+                        isShowingSettings = true
                     } label: {
-                        Label("Configure SteamGridDB Key", systemImage: "key")
+                        Label("Settings", systemImage: "slider.horizontal.3")
                     }
 
                     Button {
@@ -907,15 +911,6 @@ struct LauncherView: View {
         .padding([.top, .horizontal], 16)
     }
 
-    private func revealSteamGridDBKeyFile() {
-        try? FileManager.default.createDirectory(at: gameNestSupportDirectory, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: steamGridDBKeyURL.path) {
-            FileManager.default.createFile(atPath: steamGridDBKeyURL.path, contents: Data())
-        }
-
-        NSWorkspace.shared.activateFileViewerSelecting([steamGridDBKeyURL])
-    }
-
     private func openManualCoversFolder() {
         try? FileManager.default.createDirectory(at: manualCoversDirectory, withIntermediateDirectories: true)
         NSWorkspace.shared.open(manualCoversDirectory)
@@ -935,6 +930,109 @@ struct LauncherView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct SettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var steamGridDBAPIKey = ""
+
+    private var supportDirectory: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GameNest", isDirectory: true)
+    }
+
+    private var steamGridDBKeyURL: URL {
+        supportDirectory.appendingPathComponent("steamgriddb.key")
+    }
+
+    private var manualCoversDirectory: URL {
+        URL(fileURLWithPath: "/Applications/Games/Covers", isDirectory: true)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Settings")
+                    .font(.system(size: 18, weight: .semibold))
+
+                Spacer()
+
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Close")
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("SteamGridDB API Key")
+                    .font(.system(size: 13, weight: .semibold))
+
+                SecureField("Paste API key", text: $steamGridDBAPIKey)
+                    .textFieldStyle(.roundedBorder)
+
+                HStack {
+                    Button {
+                        openSteamGridDBAPIPage()
+                    } label: {
+                        Label("Get API Key", systemImage: "safari")
+                    }
+
+                    Button {
+                        saveSteamGridDBAPIKey()
+                    } label: {
+                        Label("Save", systemImage: "checkmark")
+                    }
+                    .keyboardShortcut(.defaultAction)
+
+                    Spacer()
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Manual Covers")
+                    .font(.system(size: 13, weight: .semibold))
+
+                Button {
+                    openManualCoversFolder()
+                } label: {
+                    Label("Open Covers Folder", systemImage: "folder")
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .onAppear {
+            loadSteamGridDBAPIKey()
+        }
+    }
+
+    private func loadSteamGridDBAPIKey() {
+        steamGridDBAPIKey = (try? String(contentsOf: steamGridDBKeyURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+    }
+
+    private func saveSteamGridDBAPIKey() {
+        try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+        let key = steamGridDBAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? key.write(to: steamGridDBKeyURL, atomically: true, encoding: .utf8)
+    }
+
+    private func openSteamGridDBAPIPage() {
+        if let url = URL(string: "https://www.steamgriddb.com/profile/preferences/api") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openManualCoversFolder() {
+        try? FileManager.default.createDirectory(at: manualCoversDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(manualCoversDirectory)
     }
 }
 
