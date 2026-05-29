@@ -113,7 +113,8 @@ GameNest/
 ├── Resources/
 │   └── AppIcon.icns   # bundled Dock/app icon
 ├── Scripts/
-│   └── Game Alias Builder.applescript
+│   ├── Game Alias Builder.applescript
+│   └── make_icon.swift            # regenerates Resources/AppIcon.icns
 ├── Sources/
 │   └── GameNest/
 │       └── main.swift
@@ -128,6 +129,7 @@ Important files:
 - `Info.plist`: macOS app bundle metadata.
 - `package_app.sh`: builds the Swift executable and packages `build/GameNest.app`.
 - `Scripts/Game Alias Builder.applescript`: helper script that creates known game aliases in `/Applications/Games`.
+- `Scripts/make_icon.swift`: CoreGraphics generator that renders the app icon and writes a 1024px PNG; combined with `sips`/`iconutil` it produces `Resources/AppIcon.icns`.
 
 ## Architecture Notes
 
@@ -155,8 +157,14 @@ Main components:
 - `GameButton`: individual game tile.
 - `GameCoverView`: square cover renderer with generated fallback art.
 - `ArtworkMode`: persisted setting for switching between covers and app icons.
+- `LauncherKeyboard`: drives arrow-key grid navigation (highlighted selection + autoscroll) while the search field keeps text-entry focus.
+- `GlobalHotKeyManager`: registers the optional user-defined system-wide hotkey via Carbon and posts a toggle notification.
+- `HotKeyRecorder`: captures a key combination in Settings for the global shortcut.
+- `SkeletonCover`: shimmering placeholder shown while a cover is being fetched online.
+- `AppInfo`: central app metadata (GitHub repo, current version, releases URL).
+- `UpdateChecker`: checks GitHub's latest release against the bundle version (silently on launch, ≤1×/day, and on demand) and surfaces a download prompt; never self-replaces.
 - `CalloutPointer`: triangle pointer at the bottom of the drawer.
-- `AppDelegate`: AppKit lifecycle, Dock toggle behavior, panel positioning, animations, single-instance guard.
+- `AppDelegate`: AppKit lifecycle, Dock toggle behavior, panel positioning, animations, single-instance guard, global-hotkey wiring, and the launch-time update check.
 
 The drawer is an `NSPanel` containing a SwiftUI `NSHostingView`. AppKit is used because SwiftUI alone does not expose enough control for Dock-style panel behavior.
 
@@ -188,6 +196,47 @@ open build/GameNest.app
 
 For Dock usage, drag `build/GameNest.app` into the Dock.
 
+## App Icon
+
+The icon is generated, not hand-drawn. `Scripts/make_icon.swift` renders a
+1024px master (dark glossy squircle, indigo→violet gradient, glassy top
+reflection, controller glyph), then `sips` produces every required size and
+`iconutil` packs them into `Resources/AppIcon.icns`:
+
+```bash
+swift Scripts/make_icon.swift icon_1024.png
+mkdir AppIcon.iconset
+for s in 16 32 32 64 128 256 256 512 512 1024; do :; done   # see commit history for the size map
+iconutil -c icns AppIcon.iconset -o Resources/AppIcon.icns
+```
+
+The `.icns` must contain all sizes (16→1024); a single-size `.icns` renders
+blank in the Dock.
+
+## Releases & Updates
+
+GameNest is distributed as a `.dmg` attached to a public GitHub release. The
+repository must be public so the unauthenticated GitHub API and the asset
+download URLs work for end users.
+
+To cut a release:
+
+1. Bump `CFBundleShortVersionString` (and `CFBundleVersion`) in `Info.plist`.
+2. `./package_app.sh` to build `build/GameNest.app`.
+3. Stage the app with an `/Applications` symlink and build the disk image:
+
+   ```bash
+   hdiutil create -volname "GameNest" -srcfolder <stage-dir> -ov -format UDZO GameNest-<version>.dmg
+   ```
+
+4. `gh release create v<version> GameNest-<version>.dmg --title "GameNest v<version>" --notes "…"`.
+
+The app checks `https://api.github.com/repos/<repo>/releases/latest`, compares
+the release tag (minus a leading `v`) against its own version with a numeric,
+dot-separated comparison, and — when a newer version exists — shows the version
+and a button that opens the `.dmg`. It never replaces itself automatically
+(the app is unsigned, so a self-replacing updater would fight Gatekeeper).
+
 ## Alias Helper
 
 `Scripts/Game Alias Builder.applescript` is a companion script for maintaining `/Applications/Games`.
@@ -213,8 +262,8 @@ The script is idempotent: it skips aliases that already exist and creates missin
 ## Future Ideas
 
 - Add a settings view for the games folder path.
-- Extend auto-detection to more launchers (Heroic, Epic, Ryujinx) beyond Steam and category-tagged apps.
+- Extend ROM/auto-detection to more emulators and launchers (Heroic, Epic, other emulators) beyond Steam, category-tagged apps, and Ryujinx ROMs.
 - Add favorites.
 - Expand time played and progress support beyond local Steam metadata.
-- Add full keyboard navigation across the grid (search focus and Return-to-launch already exist).
+- Optionally support a semi-automatic update flow (download + mount the `.dmg`) once code signing is in place.
 - Split `main.swift` into smaller files once the app grows.
