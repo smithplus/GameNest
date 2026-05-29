@@ -710,6 +710,29 @@ struct LauncherView: View {
         }
     }
 
+    private var gameNestSupportDirectory: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("GameNest", isDirectory: true)
+    }
+
+    private var steamGridDBKeyURL: URL {
+        gameNestSupportDirectory.appendingPathComponent("steamgriddb.key")
+    }
+
+    private var manualCoversDirectory: URL {
+        URL(fileURLWithPath: "/Applications/Games/Covers", isDirectory: true)
+    }
+
+    private var isSteamGridDBConfigured: Bool {
+        guard let key = try? String(contentsOf: steamGridDBKeyURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+
+        return !key.isEmpty
+    }
+
     private var displayedGames: [GameItem] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let filteredGames: [GameItem]
@@ -846,6 +869,22 @@ struct LauncherView: View {
                             }
                         }
                     }
+
+                    Divider()
+
+                    Text(isSteamGridDBConfigured ? "SteamGridDB Ready" : "SteamGridDB Key Missing")
+
+                    Button {
+                        revealSteamGridDBKeyFile()
+                    } label: {
+                        Label("Configure SteamGridDB Key", systemImage: "key")
+                    }
+
+                    Button {
+                        openManualCoversFolder()
+                    } label: {
+                        Label("Open Covers Folder", systemImage: "folder")
+                    }
                 } label: {
                     Image(systemName: "gearshape")
                 }
@@ -866,6 +905,20 @@ struct LauncherView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .padding([.top, .horizontal], 16)
+    }
+
+    private func revealSteamGridDBKeyFile() {
+        try? FileManager.default.createDirectory(at: gameNestSupportDirectory, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: steamGridDBKeyURL.path) {
+            FileManager.default.createFile(atPath: steamGridDBKeyURL.path, contents: Data())
+        }
+
+        NSWorkspace.shared.activateFileViewerSelecting([steamGridDBKeyURL])
+    }
+
+    private func openManualCoversFolder() {
+        try? FileManager.default.createDirectory(at: manualCoversDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(manualCoversDirectory)
     }
 
     private var emptyState: some View {
