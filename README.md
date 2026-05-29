@@ -43,10 +43,10 @@ Name each cover after the cleaned game name:
 
 Supported cover formats are `png`, `jpg`, `jpeg`, `heic`, and `tiff`.
 
-When a local cover is missing, GameNest searches Steam Store by game name, downloads the best available store image, and caches it in:
+When a local cover is missing, GameNest searches Steam Store by game name, downloads the best available store image only when the normalized game names match, converts it to a square tile, and caches it in:
 
 ```text
-~/Library/Application Support/GameNest/Covers
+~/Library/Application Support/GameNest/Covers/v2
 ```
 
 Local covers always take priority over cached or online covers.

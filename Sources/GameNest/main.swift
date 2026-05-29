@@ -20,7 +20,7 @@ final class GameStore: ObservableObject {
     private var cacheDirectory: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("GameNest/Covers", isDirectory: true)
+            .appendingPathComponent("GameNest/Covers/v2", isDirectory: true)
     }
 
     init() {
@@ -90,15 +90,71 @@ final class GameStore: ObservableObject {
         }
 
         for game in missingGames {
-            guard let coverData = await coverService.fetchCoverData(named: game.name, cacheDirectory: cacheDirectory),
-                  let coverImage = NSImage(data: coverData) else {
+            guard let coverData = await coverService.fetchCoverData(named: game.name),
+                  let squareCoverData = Self.squareCoverData(from: coverData),
+                  let coverImage = NSImage(data: squareCoverData) else {
                 continue
             }
+
+            Self.writeCoverData(squareCoverData, named: game.name, in: cacheDirectory)
 
             if let index = games.firstIndex(where: { $0.id == game.id }) {
                 games[index].coverImage = coverImage
             }
         }
+    }
+
+    private static func squareCoverData(from data: Data) -> Data? {
+        guard let sourceImage = NSImage(data: data) else {
+            return nil
+        }
+
+        let targetSize = NSSize(width: 512, height: 512)
+        let outputImage = NSImage(size: targetSize)
+
+        outputImage.lockFocus()
+
+        NSColor(calibratedWhite: 0.08, alpha: 1).setFill()
+        NSRect(origin: .zero, size: targetSize).fill()
+
+        let imageSize = sourceImage.size
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            outputImage.unlockFocus()
+            return nil
+        }
+
+        let scale = min(targetSize.width / imageSize.width, targetSize.height / imageSize.height)
+        let fittedSize = NSSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        let fittedRect = NSRect(
+            x: (targetSize.width - fittedSize.width) / 2,
+            y: (targetSize.height - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
+        )
+
+        sourceImage.draw(in: fittedRect, from: .zero, operation: .sourceOver, fraction: 1)
+        outputImage.unlockFocus()
+
+        guard let tiffData = outputImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private static func writeCoverData(_ data: Data, named name: String, in directory: URL) {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let cacheURL = directory.appendingPathComponent(cacheFileName(for: name))
+        try? data.write(to: cacheURL, options: [.atomic])
+    }
+
+    private static func cacheFileName(for name: String) -> String {
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
+        let sanitizedName = name.unicodeScalars.map { scalar in
+            allowedCharacters.contains(scalar) ? Character(scalar) : "-"
+        }
+        return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".png"
     }
 }
 
@@ -110,15 +166,11 @@ actor OnlineCoverService {
         self.session = session
     }
 
-    func fetchCoverData(named name: String, cacheDirectory: URL) async -> Data? {
+    func fetchCoverData(named name: String) async -> Data? {
         guard let imageURL = await steamCoverURL(for: name),
               let imageData = await downloadImageData(from: imageURL) else {
             return nil
         }
-
-        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        let cacheURL = cacheDirectory.appendingPathComponent(Self.cacheFileName(for: name))
-        try? imageData.write(to: cacheURL, options: [.atomic])
 
         return imageData
     }
@@ -152,9 +204,10 @@ actor OnlineCoverService {
             return nil
         }
 
+        let normalizedName = Self.normalizedName(name)
         return response.items.first { item in
-            item.type == "app" && item.name.localizedCaseInsensitiveCompare(name) == .orderedSame
-        }?.id ?? response.items.first { $0.type == "app" }?.id
+            item.type == "app" && Self.normalizedName(item.name) == normalizedName
+        }?.id
     }
 
     private func steamSearchImageURL(for name: String) async -> URL? {
@@ -170,12 +223,16 @@ actor OnlineCoverService {
 
         guard let url = components.url,
               let data = await data(from: url),
-              let response = try? decoder.decode(SteamSearchResponse.self, from: data),
-              let imagePath = response.items.first(where: { $0.type == "app" })?.tinyImage else {
+              let response = try? decoder.decode(SteamSearchResponse.self, from: data) else {
             return nil
         }
 
-        return URL(string: imagePath)
+        let normalizedName = Self.normalizedName(name)
+        let matchedItem = response.items.first { item in
+            item.type == "app" && Self.normalizedName(item.name) == normalizedName
+        }
+
+        return matchedItem?.tinyImage.flatMap(URL.init(string:))
     }
 
     private func steamAppDetailsImageURL(for appID: Int) async -> URL? {
@@ -220,12 +277,28 @@ actor OnlineCoverService {
         }
     }
 
-    private static func cacheFileName(for name: String) -> String {
-        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
-        let sanitizedName = name.unicodeScalars.map { scalar in
-            allowedCharacters.contains(scalar) ? Character(scalar) : "-"
+    private static func normalizedName(_ name: String) -> String {
+        name
+            .lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map { String($0) }
+            .joined()
+    }
+}
+
+struct CoverImage: View {
+    let image: NSImage
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.22)
+
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .padding(6)
         }
-        return String(sanitizedName).trimmingCharacters(in: .whitespacesAndNewlines) + ".jpg"
     }
 }
 
@@ -415,11 +488,7 @@ struct GameCoverView: View {
     var body: some View {
         ZStack {
             if let coverImage = game.coverImage {
-                Image(nsImage: coverImage)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 104, height: 104)
-                    .clipped()
+                CoverImage(image: coverImage)
             } else {
                 GeneratedCover(name: game.name)
             }
