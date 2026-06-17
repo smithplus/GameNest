@@ -49,13 +49,15 @@ The app scans:
 /Applications/Games
 ```
 
-Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, emulators, or launchers. Broken aliases are ignored on refresh, so uninstalling a target app does not leave a dead tile in GameNest. Aliases that point into Steam's `steamapps/common` folder are also hidden when Steam no longer has a matching `appmanifest_*.acf`, which avoids showing leftover game folders after an uninstall. `.webloc` files are treated as URL-scheme launchers: GameNest reads the URL inside and opens it directly, which is how Steam games (`steam://rungameid/<id>`) are launched without a real `.app` to alias.
+Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, emulators, or launchers. Broken aliases are moved to the Trash on refresh, so uninstalling a target app does not leave a dead tile in GameNest or in a Dock Stack pointed at the same folder. Aliases that point into Steam's `steamapps/common` folder are also removed when Steam no longer has a matching `appmanifest_*.acf`, which avoids showing leftover game folders after an uninstall. `.webloc` files are treated as URL-scheme launchers: GameNest reads the URL inside and opens it directly, which is how Steam games (`steam://rungameid/<id>`) are launched without a real `.app` to alias.
 
 Cover art is loaded locally from:
 
 ```text
 /Applications/Games/Covers
 ```
+
+GameNest marks `Covers/` and `.metadata/` hidden so they do not clutter Finder Dock Stacks.
 
 Name each cover after the cleaned game name:
 

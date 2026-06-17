@@ -454,6 +454,7 @@ enum GameLibraryBootstrap {
         try? fileManager.createDirectory(at: GameNestPaths.gamesDirectory, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: GameNestPaths.manualCoversDirectory, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: GameNestPaths.autoCoversDirectory, withIntermediateDirectories: true)
+        GameLibraryEntry.hideSupportFolders()
         migrateLegacyCovers()
     }
 
@@ -484,6 +485,7 @@ enum GameLibraryBootstrap {
 enum GameInstaller {
     static func run() {
         GameLibraryBootstrap.run()
+        GameLibraryEntry.pruneStaleEntries(in: GameNestPaths.gamesDirectory)
 
         var claimedNames = existingNormalizedNames()
         let detected = SteamInstalledGames.detect() + InstalledApplications.detectGames()
@@ -512,7 +514,8 @@ enum GameInstaller {
 
         return Set(
             urls
-                .filter { $0.lastPathComponent != "Covers" && $0.lastPathComponent != ".metadata" }
+                .filter { !GameLibraryEntry.isInternal($0) }
+                .filter { GameLibraryEntry.isUsable($0) }
                 .map { GameNaming.normalized(GameNaming.cleanName(for: $0)) }
         )
     }
@@ -839,6 +842,117 @@ enum InstalledApplications {
     }
 }
 
+enum GameLibraryEntry {
+    static func isInternal(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return name == ".DS_Store" || name == "Covers" || name == ".metadata"
+    }
+
+    static func hideSupportFolders() {
+        hide(GameNestPaths.manualCoversDirectory)
+        hide(GameNestPaths.metadataDirectory)
+    }
+
+    static func pruneStaleEntries(in directory: URL) {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isAliasFileKey],
+            options: []
+        ) else {
+            return
+        }
+
+        for url in urls where !isInternal(url) && !isUsable(url) {
+            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+    }
+
+    static func isUsable(_ url: URL) -> Bool {
+        if url.pathExtension == "webloc" {
+            return GameInstaller.weblocTarget(at: url) != nil
+        }
+
+        let values = try? url.resourceValues(forKeys: [.isAliasFileKey])
+        guard values?.isAliasFile == true else {
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+
+        guard let resolvedURL = try? URL(
+            resolvingAliasFileAt: url,
+            options: [.withoutUI]
+        ) else {
+            return false
+        }
+
+        if let steamInstallDirectory = steamInstallDirectory(containing: resolvedURL) {
+            return isInstalledSteamDirectory(steamInstallDirectory)
+        }
+
+        return FileManager.default.fileExists(atPath: resolvedURL.path)
+    }
+
+    private static func hide(_ url: URL) {
+        var mutableURL = url
+        var values = URLResourceValues()
+        values.isHidden = true
+        try? mutableURL.setResourceValues(values)
+    }
+
+    private static func steamInstallDirectory(containing url: URL) -> URL? {
+        let components = url.pathComponents
+        guard let steamAppsIndex = components.lastIndex(of: "steamapps"),
+              steamAppsIndex + 2 < components.count,
+              components[steamAppsIndex + 1] == "common" else {
+            return nil
+        }
+
+        let installComponents = Array(components.prefix(steamAppsIndex + 3))
+        return NSURL.fileURL(withPathComponents: installComponents)
+    }
+
+    private static func isInstalledSteamDirectory(_ installDirectory: URL) -> Bool {
+        let steamAppsDirectory = installDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let installDirectoryName = installDirectory.lastPathComponent
+
+        guard let manifestURLs = try? FileManager.default.contentsOfDirectory(
+            at: steamAppsDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for manifestURL in manifestURLs where manifestURL.lastPathComponent.hasPrefix("appmanifest_") {
+            guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8),
+                  let installDir = vdfValue(named: "installdir", in: contents),
+                  installDir == installDirectoryName else {
+                continue
+            }
+            return true
+        }
+
+        return false
+    }
+
+    private static func vdfValue(named key: String, in contents: String) -> String? {
+        let escapedKey = NSRegularExpression.escapedPattern(for: key)
+        let pattern = "\"\(escapedKey)\"\\s*\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return nil
+        }
+
+        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
+        guard let match = regex.firstMatch(in: contents, range: range),
+              let valueRange = Range(match.range(at: 1), in: contents) else {
+            return nil
+        }
+
+        return String(contents[valueRange])
+    }
+}
+
 @MainActor
 final class GameStore: ObservableObject {
     @Published private(set) var games: [GameItem] = []
@@ -877,6 +991,8 @@ final class GameStore: ObservableObject {
 
     func reload() {
         let fileManager = FileManager.default
+        GameLibraryEntry.hideSupportFolders()
+        GameLibraryEntry.pruneStaleEntries(in: gamesDirectory)
 
         guard let urls = try? fileManager.contentsOfDirectory(
             at: gamesDirectory,
@@ -895,7 +1011,7 @@ final class GameStore: ObservableObject {
             .filter { $0.lastPathComponent != ".DS_Store" }
             .filter { $0.lastPathComponent != "Covers" }
             .filter { $0.lastPathComponent != ".metadata" }
-            .filter { Self.isUsableLibraryEntry($0) }
+            .filter { GameLibraryEntry.isUsable($0) }
             .map { url -> GameItem in
                 let name = GameNaming.cleanName(for: url)
                 let normalizedName = GameNaming.normalized(name)
@@ -966,84 +1082,6 @@ final class GameStore: ObservableObject {
             return target
         }
         return url
-    }
-
-    private static func isUsableLibraryEntry(_ url: URL) -> Bool {
-        if url.pathExtension == "webloc" {
-            return GameInstaller.weblocTarget(at: url) != nil
-        }
-
-        let values = try? url.resourceValues(forKeys: [.isAliasFileKey])
-        guard values?.isAliasFile == true else {
-            return FileManager.default.fileExists(atPath: url.path)
-        }
-
-        guard let resolvedURL = try? URL(
-            resolvingAliasFileAt: url,
-            options: [.withoutUI]
-        ) else {
-            return false
-        }
-
-        if let steamInstallDirectory = steamInstallDirectory(containing: resolvedURL) {
-            return isInstalledSteamDirectory(steamInstallDirectory)
-        }
-
-        return FileManager.default.fileExists(atPath: resolvedURL.path)
-    }
-
-    private static func steamInstallDirectory(containing url: URL) -> URL? {
-        let components = url.pathComponents
-        guard let steamAppsIndex = components.lastIndex(of: "steamapps"),
-              steamAppsIndex + 2 < components.count,
-              components[steamAppsIndex + 1] == "common" else {
-            return nil
-        }
-
-        let installComponents = Array(components.prefix(steamAppsIndex + 3))
-        return NSURL.fileURL(withPathComponents: installComponents)
-    }
-
-    private static func isInstalledSteamDirectory(_ installDirectory: URL) -> Bool {
-        let steamAppsDirectory = installDirectory
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let installDirectoryName = installDirectory.lastPathComponent
-
-        guard let manifestURLs = try? FileManager.default.contentsOfDirectory(
-            at: steamAppsDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else {
-            return false
-        }
-
-        for manifestURL in manifestURLs where manifestURL.lastPathComponent.hasPrefix("appmanifest_") {
-            guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8),
-                  let installDir = vdfValue(named: "installdir", in: contents),
-                  installDir == installDirectoryName else {
-                continue
-            }
-            return true
-        }
-
-        return false
-    }
-
-    private static func vdfValue(named key: String, in contents: String) -> String? {
-        let escapedKey = NSRegularExpression.escapedPattern(for: key)
-        let pattern = "\"\(escapedKey)\"\\s*\"([^\"]+)\""
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return nil
-        }
-
-        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
-        guard let match = regex.firstMatch(in: contents, range: range),
-              let valueRange = Range(match.range(at: 1), in: contents) else {
-            return nil
-        }
-
-        return String(contents[valueRange])
     }
 
     private static func coverImage(named name: String, in directory: URL) -> NSImage? {
