@@ -149,6 +149,8 @@ Main components:
 - `GameLibraryBootstrap`: creates the folder structure and migrates the legacy cover cache.
 - `GameInstaller`: runs detection and writes Finder aliases / `.webloc` launchers into the games folder, idempotently.
 - `SteamInstalledGames`: detects installed Steam games from local manifests.
+- `EpicInstalledGames`: detects installed Epic Games Launcher entries from local launcher metadata.
+- `HeroicInstalledGames`: detects installed Heroic/Legendary/GOG/sideload entries only when their local install path still exists.
 - `InstalledApplications`: detects installed `.app` games by app category (GOG, itch.io, emulators, standalone).
 - `EmulatorROMs`: detects ROMs from an emulator's configured game directories (Ryujinx) and exposes them as in-memory games launched via the emulator.
 - `GameStore`: scans `/Applications/Games`, merges detected emulator ROMs, resolves local/saved cover art, sorts items, and triggers detection via `rescan()`.

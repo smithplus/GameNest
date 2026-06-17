@@ -14,6 +14,10 @@ let package = Package(
         .executableTarget(
             name: "GameNest",
             path: "Sources/GameNest"
+        ),
+        .testTarget(
+            name: "GameNestTests",
+            dependencies: ["GameNest"]
         )
     ]
 )

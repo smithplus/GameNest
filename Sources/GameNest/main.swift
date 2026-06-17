@@ -488,7 +488,10 @@ enum GameInstaller {
         GameLibraryEntry.pruneStaleEntries(in: GameNestPaths.gamesDirectory)
 
         var claimedNames = existingNormalizedNames()
-        let detected = SteamInstalledGames.detect() + InstalledApplications.detectGames()
+        let detected = SteamInstalledGames.detect()
+            + EpicInstalledGames.detect()
+            + HeroicInstalledGames.detect()
+            + InstalledApplications.detectGames()
 
         for game in detected {
             let normalized = GameNaming.normalized(game.name)
@@ -670,6 +673,221 @@ enum EmulatorROMs {
         let autoloadDirs = (json["autoload_dirs"] as? [String]) ?? []
         let unique = Array(Set(gameDirs + autoloadDirs))
         return unique.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+}
+
+/// Reads installed Epic Games Launcher entries and exposes them as `com.epicgames.launcher://` launchers.
+enum EpicInstalledGames {
+    static func detect() -> [DetectedGame] {
+        let launcherInstalledURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Epic/UnrealEngineLauncher/LauncherInstalled.dat")
+
+        guard let data = try? Data(contentsOf: launcherInstalledURL) else {
+            return []
+        }
+
+        return detect(fromLauncherInstalledData: data)
+    }
+
+    static func detect(fromLauncherInstalledData data: Data) -> [DetectedGame] {
+        guard let json = try? JSONSerialization.jsonObject(with: data),
+              let root = json as? [String: Any],
+              let installations = root["InstallationList"] as? [[String: Any]] else {
+            return []
+        }
+
+        var games: [DetectedGame] = []
+        var seenAppNames: Set<String> = []
+
+        for installation in installations {
+            guard let appName = stringValue(in: installation, keys: ["AppName", "AppId"]),
+                  seenAppNames.insert(appName).inserted,
+                  hasExistingInstallLocation(in: installation),
+                  let launchURL = epicLaunchURL(appName: appName) else {
+                continue
+            }
+
+            let name = stringValue(in: installation, keys: ["DisplayName", "AppName"]) ?? appName
+            games.append(DetectedGame(name: name, launch: .urlScheme(launchURL)))
+        }
+
+        return games
+    }
+
+    private static func hasExistingInstallLocation(in installation: [String: Any]) -> Bool {
+        guard let path = stringValue(in: installation, keys: ["InstallLocation", "InstallDir", "InstallPath"]),
+              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    private static func epicLaunchURL(appName: String) -> URL? {
+        guard let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            return nil
+        }
+
+        return URL(string: "com.epicgames.launcher://apps/\(encodedAppName)?action=launch&silent=true")
+    }
+
+    private static func stringValue(in dictionary: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = dictionary[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+        return nil
+    }
+}
+
+/// Reads Heroic Games Launcher metadata and exposes installed entries through `heroic://` launchers.
+enum HeroicInstalledGames {
+    static func detect() -> [DetectedGame] {
+        let heroicDirectory = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("heroic", isDirectory: true)
+
+        let manifests: [(URL, String)] = [
+            (
+                heroicDirectory.appendingPathComponent("legendaryConfig/legendary/installed.json"),
+                "legendary"
+            ),
+            (
+                heroicDirectory.appendingPathComponent("sideload_apps/library.json"),
+                "sideload"
+            ),
+            (
+                heroicDirectory.appendingPathComponent("store_cache/gog_library.json"),
+                "gog"
+            )
+        ]
+
+        var games: [DetectedGame] = []
+        var seenNames: Set<String> = []
+
+        for (url, defaultRunner) in manifests {
+            guard let data = try? Data(contentsOf: url) else {
+                continue
+            }
+
+            for game in detect(fromInstalledData: data, defaultRunner: defaultRunner) {
+                let normalized = GameNaming.normalized(game.name)
+                guard !normalized.isEmpty, seenNames.insert(normalized).inserted else {
+                    continue
+                }
+                games.append(game)
+            }
+        }
+
+        return games
+    }
+
+    static func detect(fromInstalledData data: Data, defaultRunner: String = "legendary") -> [DetectedGame] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        let entries: [(String?, [String: Any])] = {
+            if let root = json as? [String: Any],
+               let games = root["games"] as? [[String: Any]] {
+                return games.map { (nil, $0) }
+            }
+
+            if let root = json as? [String: Any] {
+                return root.compactMap { key, value in
+                    guard !key.hasPrefix("__"),
+                          let entry = value as? [String: Any] else {
+                        return nil
+                    }
+                    return (key, entry)
+                }
+            }
+
+            if let array = json as? [[String: Any]] {
+                return array.map { (nil, $0) }
+            }
+
+            return []
+        }()
+
+        var games: [DetectedGame] = []
+        var seenAppNames: Set<String> = []
+
+        for (key, entry) in entries {
+            guard isInstalled(entry),
+                  installPathExists(in: entry),
+                  let appName = stringValue(in: entry, keys: ["app_name", "appName", "appId"]) ?? key,
+                  seenAppNames.insert(appName).inserted else {
+                continue
+            }
+
+            let runner = stringValue(in: entry, keys: ["runner"]) ?? defaultRunner
+            guard let launchURL = heroicLaunchURL(runner: runner, appName: appName) else {
+                continue
+            }
+
+            let name = stringValue(in: entry, keys: ["title", "displayName", "name"]) ?? appName
+            games.append(DetectedGame(name: name, launch: .urlScheme(launchURL)))
+        }
+
+        return games
+    }
+
+    private static func isInstalled(_ entry: [String: Any]) -> Bool {
+        if let installed = entry["is_installed"] as? Bool {
+            return installed
+        }
+
+        if let installed = entry["isInstalled"] as? Bool {
+            return installed
+        }
+
+        return true
+    }
+
+    private static func installPathExists(in entry: [String: Any]) -> Bool {
+        let directPath = stringValue(
+            in: entry,
+            keys: ["install_path", "installPath", "installLocation", "folder_name"]
+        )
+
+        let nestedInstall = entry["install"] as? [String: Any]
+        let nestedPath = nestedInstall.flatMap {
+            stringValue(in: $0, keys: ["install_path", "installPath", "executable"])
+        }
+
+        guard let path = directPath ?? nestedPath,
+              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    private static func heroicLaunchURL(runner: String, appName: String) -> URL? {
+        guard let encodedRunner = runner.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let encodedAppName = appName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            return nil
+        }
+
+        return URL(string: "heroic://launch/\(encodedRunner)/\(encodedAppName)")
+    }
+
+    private static func stringValue(in dictionary: [String: Any], keys: [String]) -> String? {
+        for key in keys {
+            if let value = dictionary[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+        return nil
     }
 }
 
