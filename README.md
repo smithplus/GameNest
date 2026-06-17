@@ -130,6 +130,7 @@ Important files:
 - `Package.swift`: Swift Package executable definition.
 - `Info.plist`: macOS app bundle metadata.
 - `package_app.sh`: builds the Swift executable and packages `build/GameNest.app`.
+- `package_release.sh`: builds the app and creates a release `.dmg` with `GameNest.app` plus an `/Applications` alias for drag-and-drop installs.
 - `Scripts/Game Alias Builder.applescript`: helper script that creates known game aliases in `/Applications/Games`.
 - `Scripts/make_icon.swift`: CoreGraphics generator that renders the app icon and writes a 1024px PNG; combined with `sips`/`iconutil` it produces `Resources/AppIcon.icns`.
 
@@ -226,20 +227,16 @@ download URLs work for end users.
 To cut a release:
 
 1. Bump `CFBundleShortVersionString` (and `CFBundleVersion`) in `Info.plist`.
-2. `./package_app.sh` to build `build/GameNest.app`.
-3. Stage the app with an `/Applications` symlink and build the disk image:
-
-   ```bash
-   hdiutil create -volname "GameNest" -srcfolder <stage-dir> -ov -format UDZO GameNest-<version>.dmg
-   ```
-
-4. `gh release create v<version> GameNest-<version>.dmg --title "GameNest v<version>" --notes "…"`.
+2. `./package_release.sh` to build `build/GameNest.app` and `Releases/GameNest-<version>.dmg`.
+3. `gh release create v<version> Releases/GameNest-<version>.dmg --title "GameNest v<version>" --notes "…"`.
 
 The app checks `https://api.github.com/repos/<repo>/releases/latest`, compares
 the release tag (minus a leading `v`) against its own version with a numeric,
-dot-separated comparison, and — when a newer version exists — shows the version
-and a button that opens the `.dmg`. It never replaces itself automatically
-(the app is unsigned, so a self-replacing updater would fight Gatekeeper).
+dot-separated comparison, and — when a newer version exists — downloads the
+`.dmg` to the user's Downloads folder and opens it. The DMG includes an
+Applications alias for manual drag-and-drop installation. It does not replace
+the running app in place; doing that robustly requires a signed helper or an
+updater framework such as Sparkle.
 
 ## Alias Helper
 

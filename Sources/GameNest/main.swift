@@ -2476,6 +2476,8 @@ final class UpdateChecker: ObservableObject {
         case checking
         case upToDate
         case available(version: String, url: URL)
+        case downloading(version: String)
+        case readyToInstall(version: String, url: URL)
         case failed(String)
     }
 
@@ -2528,38 +2530,81 @@ final class UpdateChecker: ObservableObject {
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 return .failed("GitHub returned an error.")
             }
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = json["tag_name"] as? String else {
-                return .failed("Unexpected response.")
-            }
-
-            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-
-            // Prefer the .dmg asset; fall back to the release page.
-            var downloadURL = (json["html_url"] as? String).flatMap { URL(string: $0) } ?? AppInfo.releasesURL
-            if let assets = json["assets"] as? [[String: Any]] {
-                for asset in assets {
-                    if let name = asset["name"] as? String, name.hasSuffix(".dmg"),
-                       let urlString = asset["browser_download_url"] as? String,
-                       let url = URL(string: urlString) {
-                        downloadURL = url
-                        break
-                    }
-                }
-            }
-
-            if Self.isNewer(latest, than: AppInfo.currentVersion) {
-                return .available(version: latest, url: downloadURL)
-            } else {
-                return .upToDate
-            }
+            return Self.state(fromLatestReleaseData: data, currentVersion: AppInfo.currentVersion)
         } catch {
             return .failed("Could not reach GitHub.")
         }
     }
 
+    nonisolated static func state(fromLatestReleaseData data: Data, currentVersion: String) -> State {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = json["tag_name"] as? String else {
+            return .failed("Unexpected response.")
+        }
+
+        let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+
+        var downloadURL = (json["html_url"] as? String).flatMap { URL(string: $0) } ?? AppInfo.releasesURL
+        if let assets = json["assets"] as? [[String: Any]] {
+            for asset in assets {
+                if let name = asset["name"] as? String, name.lowercased().hasSuffix(".dmg"),
+                   let urlString = asset["browser_download_url"] as? String,
+                   let url = URL(string: urlString) {
+                    downloadURL = url
+                    break
+                }
+            }
+        }
+
+        if Self.isNewer(latest, than: currentVersion) {
+            return .available(version: latest, url: downloadURL)
+        } else {
+            return .upToDate
+        }
+    }
+
+    func downloadAndOpen(version: String, url: URL) {
+        guard url.pathExtension.lowercased() == "dmg" else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+
+        state = .downloading(version: version)
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let fileURL = try await Self.downloadDMG(from: url, version: version)
+                self.state = .readyToInstall(version: version, url: fileURL)
+                NSWorkspace.shared.open(fileURL)
+            } catch {
+                self.state = .failed("Could not download update.")
+            }
+        }
+    }
+
+    private nonisolated static func downloadDMG(from url: URL, version: String) async throws -> URL {
+        var request = URLRequest(url: url)
+        request.setValue("GameNest", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 60
+
+        let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        let destination = downloads.appendingPathComponent("GameNest-\(version).dmg")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
+    }
+
     /// Numeric, dot-separated version compare (e.g. "0.2.0" vs "0.10.1").
-    static func isNewer(_ lhs: String, than rhs: String) -> Bool {
+    nonisolated static func isNewer(_ lhs: String, than rhs: String) -> Bool {
         let l = lhs.split(separator: ".").map { Int($0) ?? 0 }
         let r = rhs.split(separator: ".").map { Int($0) ?? 0 }
         for i in 0..<max(l.count, r.count) {
@@ -2574,10 +2619,10 @@ final class UpdateChecker: ObservableObject {
         let alert = NSAlert()
         alert.messageText = "Update Available"
         alert.informativeText = "GameNest \(version) is available. You're on \(AppInfo.currentVersion)."
-        alert.addButton(withTitle: "Download")
+        alert.addButton(withTitle: url.pathExtension.lowercased() == "dmg" ? "Download & Open" : "Open Release")
         alert.addButton(withTitle: "Later")
         if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(url)
+            downloadAndOpen(version: version, url: url)
         }
     }
 }
@@ -2825,11 +2870,19 @@ struct SettingsView: View {
                 .foregroundStyle(.green)
         case let .available(version, url):
             Button {
-                NSWorkspace.shared.open(url)
+                updateChecker.downloadAndOpen(version: version, url: url)
             } label: {
-                Label("Download v\(version)", systemImage: "arrow.down.circle.fill")
+                Label(url.pathExtension.lowercased() == "dmg" ? "Download & Open v\(version)" : "Open v\(version)", systemImage: "arrow.down.circle.fill")
             }
             .foregroundStyle(Color.accentColor)
+        case let .downloading(version):
+            Label("Downloading v\(version)…", systemImage: "arrow.down.circle.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+        case let .readyToInstall(version, _):
+            Label("Opened installer v\(version)", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.green)
         case let .failed(message):
             Label(message, systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 12, weight: .medium))
