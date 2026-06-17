@@ -985,7 +985,65 @@ final class GameStore: ObservableObject {
             return false
         }
 
+        if let steamInstallDirectory = steamInstallDirectory(containing: resolvedURL) {
+            return isInstalledSteamDirectory(steamInstallDirectory)
+        }
+
         return FileManager.default.fileExists(atPath: resolvedURL.path)
+    }
+
+    private static func steamInstallDirectory(containing url: URL) -> URL? {
+        let components = url.pathComponents
+        guard let steamAppsIndex = components.lastIndex(of: "steamapps"),
+              steamAppsIndex + 2 < components.count,
+              components[steamAppsIndex + 1] == "common" else {
+            return nil
+        }
+
+        let installComponents = Array(components.prefix(steamAppsIndex + 3))
+        return NSURL.fileURL(withPathComponents: installComponents)
+    }
+
+    private static func isInstalledSteamDirectory(_ installDirectory: URL) -> Bool {
+        let steamAppsDirectory = installDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let installDirectoryName = installDirectory.lastPathComponent
+
+        guard let manifestURLs = try? FileManager.default.contentsOfDirectory(
+            at: steamAppsDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+
+        for manifestURL in manifestURLs where manifestURL.lastPathComponent.hasPrefix("appmanifest_") {
+            guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8),
+                  let installDir = vdfValue(named: "installdir", in: contents),
+                  installDir == installDirectoryName else {
+                continue
+            }
+            return true
+        }
+
+        return false
+    }
+
+    private static func vdfValue(named key: String, in contents: String) -> String? {
+        let escapedKey = NSRegularExpression.escapedPattern(for: key)
+        let pattern = "\"\(escapedKey)\"\\s*\"([^\"]+)\""
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return nil
+        }
+
+        let range = NSRange(contents.startIndex..<contents.endIndex, in: contents)
+        guard let match = regex.firstMatch(in: contents, range: range),
+              let valueRange = Range(match.range(at: 1), in: contents) else {
+            return nil
+        }
+
+        return String(contents[valueRange])
     }
 
     private static func coverImage(named name: String, in directory: URL) -> NSImage? {
