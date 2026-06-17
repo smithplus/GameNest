@@ -895,6 +895,7 @@ final class GameStore: ObservableObject {
             .filter { $0.lastPathComponent != ".DS_Store" }
             .filter { $0.lastPathComponent != "Covers" }
             .filter { $0.lastPathComponent != ".metadata" }
+            .filter { Self.isUsableLibraryEntry($0) }
             .map { url -> GameItem in
                 let name = GameNaming.cleanName(for: url)
                 let normalizedName = GameNaming.normalized(name)
@@ -965,6 +966,26 @@ final class GameStore: ObservableObject {
             return target
         }
         return url
+    }
+
+    private static func isUsableLibraryEntry(_ url: URL) -> Bool {
+        if url.pathExtension == "webloc" {
+            return GameInstaller.weblocTarget(at: url) != nil
+        }
+
+        let values = try? url.resourceValues(forKeys: [.isAliasFileKey])
+        guard values?.isAliasFile == true else {
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+
+        guard let resolvedURL = try? URL(
+            resolvingAliasFileAt: url,
+            options: [.withoutUI]
+        ) else {
+            return false
+        }
+
+        return FileManager.default.fileExists(atPath: resolvedURL.path)
     }
 
     private static func coverImage(named name: String, in directory: URL) -> NSImage? {

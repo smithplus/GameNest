@@ -49,7 +49,7 @@ The app scans:
 /Applications/Games
 ```
 
-Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, emulators, or launchers. `.webloc` files are treated as URL-scheme launchers: GameNest reads the URL inside and opens it directly, which is how Steam games (`steam://rungameid/<id>`) are launched without a real `.app` to alias.
+Every visible file in that folder is treated as a launchable item. This works well with macOS alias files that point to apps, emulators, or launchers. Broken aliases are ignored on refresh, so uninstalling a target app does not leave a dead tile in GameNest. `.webloc` files are treated as URL-scheme launchers: GameNest reads the URL inside and opens it directly, which is how Steam games (`steam://rungameid/<id>`) are launched without a real `.app` to alias.
 
 Cover art is loaded locally from:
 
